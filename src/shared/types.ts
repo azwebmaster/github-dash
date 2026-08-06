@@ -180,11 +180,13 @@ export interface WorkflowStats {
   successRate: number;
   duration: TimingStats;
   byWorkflow: Array<{
+    workflowId: number;
     name: string;
     total: number;
     success: number;
     failure: number;
     avgDurationSeconds: number | null;
+    maxDurationSeconds: number | null;
   }>;
   recentConclusions: Array<{ date: string; success: number; failure: number; other: number }>;
 }

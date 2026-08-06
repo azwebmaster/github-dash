@@ -25,6 +25,7 @@ import CommitDetailPage from './pages/CommitDetailPage';
 import ReleasesPage from './pages/ReleasesPage';
 import ReleaseDetailPage from './pages/ReleaseDetailPage';
 import WorkflowsPage from './pages/WorkflowsPage';
+import WorkflowRunsPage from './pages/WorkflowRunsPage';
 import WorkflowDetailPage from './pages/WorkflowDetailPage';
 
 const nav = [
@@ -126,6 +127,8 @@ export default function App() {
           <Route path="/releases" element={<ReleasesPage />} />
           <Route path="/releases/:id" element={<ReleaseDetailPage />} />
           <Route path="/workflows" element={<WorkflowsPage />} />
+          <Route path="/workflows/by/:workflowId" element={<WorkflowRunsPage />} />
+          <Route path="/workflows/runs/:id" element={<WorkflowDetailPage />} />
           <Route path="/workflows/:id" element={<WorkflowDetailPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

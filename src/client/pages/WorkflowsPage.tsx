@@ -12,7 +12,7 @@ import {
   Typography,
   Grid2 as Grid,
 } from '@mui/material';
-import { Link as RouterLink } from 'react-router-dom';
+import { Link as RouterLink, useNavigate } from 'react-router-dom';
 import { BarChart } from '@mui/x-charts/BarChart';
 import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
@@ -36,6 +36,7 @@ function conclusionChip(conclusion: string | null, status: string | null) {
 }
 
 export default function WorkflowsPage() {
+  const navigate = useNavigate();
   const { data, error, loading } = useAsyncData(() => api.workflows(), []);
 
   if (loading) return <LoadingBlock rows={8} />;
@@ -45,7 +46,10 @@ export default function WorkflowsPage() {
 
   return (
     <Stack spacing={3}>
-      <PageHeader title="Workflows" subtitle="GitHub Actions run metrics, success rate, and duration" />
+      <PageHeader
+        title="Workflows"
+        subtitle="Click a workflow to see its runs, then open a run for job and step timings"
+      />
 
       <Grid container spacing={2}>
         <Grid size={{ xs: 6, md: 3 }}>
@@ -87,8 +91,23 @@ export default function WorkflowsPage() {
               </TableHead>
               <TableBody>
                 {stats.byWorkflow.map((w) => (
-                  <TableRow key={w.name}>
-                    <TableCell>{w.name}</TableCell>
+                  <TableRow
+                    key={w.workflowId}
+                    hover
+                    sx={{ cursor: 'pointer' }}
+                    onClick={() => navigate(`/workflows/by/${w.workflowId}`)}
+                  >
+                    <TableCell>
+                      <Link
+                        component={RouterLink}
+                        to={`/workflows/by/${w.workflowId}`}
+                        underline="hover"
+                        fontWeight={600}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {w.name}
+                      </Link>
+                    </TableCell>
                     <TableCell align="right">{w.total}</TableCell>
                     <TableCell align="right">
                       {w.total ? Math.round((w.success / w.total) * 100) : 0}%
@@ -142,11 +161,25 @@ export default function WorkflowsPage() {
             {items.map((run) => (
               <TableRow key={run.id} hover>
                 <TableCell>
-                  <Link component={RouterLink} to={`/workflows/${run.id}`} underline="hover" fontWeight={600}>
+                  <Link
+                    component={RouterLink}
+                    to={`/workflows/runs/${run.id}`}
+                    underline="hover"
+                    fontWeight={600}
+                  >
                     #{run.id}
                   </Link>
                 </TableCell>
-                <TableCell>{run.name}</TableCell>
+                <TableCell>
+                  <Link
+                    component={RouterLink}
+                    to={`/workflows/by/${run.workflowId}`}
+                    underline="hover"
+                    color="inherit"
+                  >
+                    {run.name}
+                  </Link>
+                </TableCell>
                 <TableCell sx={{ fontFamily: '"IBM Plex Mono", monospace' }}>{run.branch || '—'}</TableCell>
                 <TableCell>{run.event}</TableCell>
                 <TableCell>{formatDate(run.runStartedAt ?? run.createdAt)}</TableCell>
