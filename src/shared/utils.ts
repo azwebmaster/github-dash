@@ -97,3 +97,21 @@ export function formatDurationSeconds(seconds: number | null | undefined): strin
   if (seconds < 3600) return `${round(seconds / 60, 1)}m`;
   return `${round(seconds / 3600, 1)}h`;
 }
+
+const FAILURE_CONCLUSIONS = new Set([
+  'failure',
+  'timed_out',
+  'startup_failure',
+  'action_required',
+]);
+
+/** Roll up individual check/status items into an overall PR check state. */
+export function rollupCheckState(
+  checks: Array<{ status: string; conclusion: string | null }>,
+): 'pending' | 'success' | 'failure' | 'neutral' {
+  if (checks.length === 0) return 'neutral';
+  if (checks.some((c) => c.status !== 'completed')) return 'pending';
+  if (checks.some((c) => c.conclusion && FAILURE_CONCLUSIONS.has(c.conclusion))) return 'failure';
+  if (checks.some((c) => c.conclusion === 'success')) return 'success';
+  return 'neutral';
+}

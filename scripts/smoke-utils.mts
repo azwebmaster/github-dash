@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
-import { parsePrNumbersFromReleaseNotes, parseRepoArg, computeTimingStats } from '../src/shared/utils.ts';
+import {
+  parsePrNumbersFromReleaseNotes,
+  parseRepoArg,
+  computeTimingStats,
+  rollupCheckState,
+} from '../src/shared/utils.ts';
 
 const notes = `
 ## What's Changed
@@ -20,5 +25,23 @@ assert.equal(stats.avgHours, 4);
 assert.equal(stats.medianHours, 3);
 assert.equal(stats.minHours, 1);
 assert.equal(stats.maxHours, 10);
+
+assert.equal(rollupCheckState([]), 'neutral');
+assert.equal(rollupCheckState([{ status: 'in_progress', conclusion: null }]), 'pending');
+assert.equal(
+  rollupCheckState([
+    { status: 'completed', conclusion: 'success' },
+    { status: 'completed', conclusion: 'failure' },
+  ]),
+  'failure',
+);
+assert.equal(
+  rollupCheckState([
+    { status: 'completed', conclusion: 'success' },
+    { status: 'completed', conclusion: 'skipped' },
+  ]),
+  'success',
+);
+assert.equal(rollupCheckState([{ status: 'completed', conclusion: 'cancelled' }]), 'neutral');
 
 console.log('ok');

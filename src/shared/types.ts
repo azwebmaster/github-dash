@@ -38,6 +38,7 @@ export interface PrSummary {
 export interface PrDetail extends PrSummary {
   body: string | null;
   commits: number;
+  headSha: string;
   reviewers: string[];
   requestedReviewers: string[];
   timeline: Array<{
@@ -45,6 +46,28 @@ export interface PrDetail extends PrSummary {
     createdAt: string;
     actor: string | null;
   }>;
+}
+
+export type PrCheckState = 'pending' | 'success' | 'failure' | 'neutral';
+
+export interface PrCheck {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  durationSeconds: number | null;
+  htmlUrl: string | null;
+  appName: string | null;
+}
+
+export interface PrChecks {
+  headSha: string;
+  shortSha: string;
+  state: PrCheckState;
+  totalCount: number;
+  checks: PrCheck[];
 }
 
 export interface PrStats {
