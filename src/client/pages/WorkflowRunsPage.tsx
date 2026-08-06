@@ -11,7 +11,7 @@ import {
   TableHead,
   TableRow,
   Typography,
-  Grid2 as Grid,
+  Grid,
 } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import { Link as RouterLink, useParams } from 'react-router-dom';
@@ -39,19 +39,18 @@ function conclusionChip(conclusion: string | null, status: string | null) {
 export default function WorkflowRunsPage() {
   const { workflowId: workflowIdParam } = useParams();
   const workflowId = Number(workflowIdParam);
-  const { data, error, loading } = useAsyncData(() => api.workflows(), [workflowId]);
+  const validId = Number.isFinite(workflowId);
+  const { data, error, loading } = useAsyncData(
+    () => (validId ? api.workflowRuns(workflowId) : Promise.reject(new Error('Invalid workflow id'))),
+    [workflowId, validId],
+  );
 
+  if (!validId) return <ErrorState message="Invalid workflow id" />;
   if (loading) return <LoadingBlock rows={8} />;
   if (error || !data) return <ErrorState message={error ?? 'No data'} />;
-  if (!Number.isFinite(workflowId)) return <ErrorState message="Invalid workflow id" />;
 
-  const workflowMeta = data.stats.byWorkflow.find((w) => w.workflowId === workflowId);
-  const runs = data.items.filter((r) => r.workflowId === workflowId);
-  const name = workflowMeta?.name ?? runs[0]?.workflowName ?? `Workflow ${workflowId}`;
-
-  if (!workflowMeta && runs.length === 0) {
-    return <ErrorState message={`No runs found for workflow ${workflowId}`} />;
-  }
+  const runs = data.items;
+  const name = data.name;
 
   const success = runs.filter((r) => r.conclusion === 'success').length;
   const failure = runs.filter((r) => r.conclusion === 'failure').length;
@@ -72,7 +71,10 @@ export default function WorkflowRunsPage() {
         All workflows
       </Button>
 
-      <PageHeader title={name} subtitle={`${runs.length} recent run${runs.length === 1 ? '' : 's'} · workflow #${workflowId}`} />
+      <PageHeader
+        title={name}
+        subtitle={`Past ${runs.length} run${runs.length === 1 ? '' : 's'} · workflow #${workflowId}`}
+      />
 
       <Grid container spacing={2}>
         <Grid size={{ xs: 6, md: 3 }}>
@@ -145,7 +147,7 @@ export default function WorkflowRunsPage() {
         </Table>
         {runs.length === 0 ? (
           <Typography sx={{ p: 2 }} color="text.secondary">
-            No runs for this workflow in the loaded window.
+            No runs found for this workflow.
           </Typography>
         ) : null}
       </TableContainer>

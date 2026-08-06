@@ -110,6 +110,19 @@ export function createApp(options: CreateAppOptions): Express {
     }
   });
 
+  app.get('/api/workflows/by/:workflowId', async (req, res, next) => {
+    try {
+      const workflowId = Number(req.params.workflowId);
+      if (!Number.isFinite(workflowId)) {
+        res.status(400).json({ error: 'Invalid workflow id' });
+        return;
+      }
+      res.json(await github.listRunsForWorkflow(workflowId));
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.get('/api/workflows/:id', async (req, res, next) => {
     try {
       const id = Number(req.params.id);
