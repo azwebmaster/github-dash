@@ -1,0 +1,68 @@
+{
+  "name": "github-dash",
+  "version": "1.0.0",
+  "description": "GitHub repository dashboard — PRs, commits, releases, and workflow metrics",
+  "type": "module",
+  "bin": {
+    "github-dash": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "concurrently -k \"pnpm dev:server\" \"pnpm dev:client\"",
+    "dev:server": "tsx watch src/server/cli-dev.ts",
+    "dev:client": "vite",
+    "build": "pnpm build:client && pnpm build:server",
+    "build:client": "vite build",
+    "build:server": "tsc -p tsconfig.server.json",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "test": "tsx scripts/smoke-utils.mts"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "github",
+    "dashboard",
+    "cli",
+    "pull-requests",
+    "releases",
+    "actions"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.0",
+    "@mui/icons-material": "^6.4.0",
+    "@mui/material": "^6.4.0",
+    "@mui/x-charts": "^7.24.0",
+    "@octokit/rest": "^21.1.0",
+    "commander": "^13.1.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "open": "^10.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.1.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
