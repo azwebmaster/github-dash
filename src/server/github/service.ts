@@ -503,20 +503,26 @@ export class GitHubService {
     const other = runs.length - success - failure - cancelled;
 
     const byWorkflowMap = new Map<
-      string,
-      { total: number; success: number; failure: number; durations: number[] }
+      number,
+      { name: string; total: number; success: number; failure: number; durations: number[] }
     >();
 
     const dayMap = new Map<string, { success: number; failure: number; other: number }>();
 
     for (const run of runs) {
-      const key = run.workflowName;
-      const entry = byWorkflowMap.get(key) ?? { total: 0, success: 0, failure: 0, durations: [] };
+      const entry = byWorkflowMap.get(run.workflowId) ?? {
+        name: run.workflowName,
+        total: 0,
+        success: 0,
+        failure: 0,
+        durations: [],
+      };
+      entry.name = run.workflowName;
       entry.total += 1;
       if (run.conclusion === 'success') entry.success += 1;
       if (run.conclusion === 'failure') entry.failure += 1;
-      if (run.durationSeconds != null) entry.durations.push(run.durationSeconds / 3600);
-      byWorkflowMap.set(key, entry);
+      if (run.durationSeconds != null) entry.durations.push(run.durationSeconds);
+      byWorkflowMap.set(run.workflowId, entry);
 
       const day = (run.runStartedAt ?? run.createdAt).slice(0, 10);
       const dayEntry = dayMap.get(day) ?? { success: 0, failure: 0, other: 0 };
@@ -537,15 +543,17 @@ export class GitHubService {
       successRate: runs.length ? round((success / runs.length) * 100, 1) : 0,
       duration: computeTimingStats(durationHours),
       byWorkflow: [...byWorkflowMap.entries()]
-        .map(([name, v]) => ({
-          name,
+        .map(([workflowId, v]) => ({
+          workflowId,
+          name: v.name,
           total: v.total,
           success: v.success,
           failure: v.failure,
           avgDurationSeconds:
             v.durations.length > 0
-              ? round((v.durations.reduce((a, b) => a + b, 0) / v.durations.length) * 3600)
+              ? round(v.durations.reduce((a, b) => a + b, 0) / v.durations.length)
               : null,
+          maxDurationSeconds: v.durations.length > 0 ? Math.max(...v.durations) : null,
         }))
         .sort((a, b) => b.total - a.total),
       recentConclusions: [...dayMap.entries()]
