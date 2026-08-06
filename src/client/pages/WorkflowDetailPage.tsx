@@ -12,7 +12,7 @@ import {
   TableHead,
   TableRow,
   Typography,
-  Grid2 as Grid,
+  Grid,
 } from '@mui/material';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';

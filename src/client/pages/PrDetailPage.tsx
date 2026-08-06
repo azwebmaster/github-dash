@@ -7,7 +7,7 @@ import {
   Paper,
   Stack,
   Typography,
-  Grid2 as Grid,
+  Grid,
   Button,
 } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';

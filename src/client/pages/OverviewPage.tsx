@@ -1,4 +1,4 @@
-import { Grid2 as Grid, Link, Paper, Stack, Typography } from '@mui/material';
+import { Grid, Link, Paper, Stack, Typography } from '@mui/material';
 import { Link as RouterLink } from 'react-router-dom';
 import { BarChart } from '@mui/x-charts/BarChart';
 import { api } from '../api/client';
