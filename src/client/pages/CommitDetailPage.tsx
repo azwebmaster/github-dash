@@ -17,6 +17,7 @@ import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import { Link as RouterLink, useParams } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
+import { MarkdownContent } from '../components/MarkdownContent';
 import { ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
 
 export default function CommitDetailPage() {
@@ -66,9 +67,7 @@ export default function CommitDetailPage() {
           <Typography variant="h6" gutterBottom>
             Body
           </Typography>
-          <Typography component="pre" variant="body2" sx={{ whiteSpace: 'pre-wrap', m: 0 }}>
-            {data.body}
-          </Typography>
+          <MarkdownContent content={data.body} />
         </Paper>
       ) : null}
 

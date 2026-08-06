@@ -18,6 +18,7 @@ import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import { Link as RouterLink, useParams } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
+import { MarkdownContent } from '../components/MarkdownContent';
 import { ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
 import { formatDurationHours } from '../../shared/utils';
 
@@ -72,20 +73,7 @@ export default function ReleaseDetailPage() {
             <Typography variant="h6" gutterBottom>
               Release notes
             </Typography>
-            <Typography
-              component="pre"
-              variant="body2"
-              sx={{
-                whiteSpace: 'pre-wrap',
-                m: 0,
-                maxHeight: 480,
-                overflow: 'auto',
-                fontFamily: '"IBM Plex Sans", sans-serif',
-                color: data.body ? 'text.primary' : 'text.secondary',
-              }}
-            >
-              {data.body || 'No release notes.'}
-            </Typography>
+            <MarkdownContent content={data.body} empty="No release notes." maxHeight={480} />
           </Paper>
         </Grid>
         <Grid size={{ xs: 12, md: 6 }}>
