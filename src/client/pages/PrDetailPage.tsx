@@ -17,12 +17,133 @@ import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
 import { MarkdownContent } from '../components/MarkdownContent';
 import { ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
-import { formatDurationHours } from '../../shared/utils';
+import { formatDurationHours, formatDurationSeconds } from '../../shared/utils';
+import type { PrCheck, PrChecks, PrCheckState } from '../../shared/types';
+
+const CHECKS_POLL_MS = 5_000;
+
+function overallCheckChip(state: PrCheckState) {
+  switch (state) {
+    case 'success':
+      return <Chip label="checks passing" color="success" size="small" />;
+    case 'failure':
+      return <Chip label="checks failing" color="error" size="small" />;
+    case 'pending':
+      return <Chip label="checks running" color="info" size="small" variant="outlined" />;
+    default:
+      return <Chip label="no checks" size="small" variant="outlined" />;
+  }
+}
+
+function checkStatusChip(check: PrCheck) {
+  if (check.status !== 'completed') {
+    return <Chip size="small" label={check.status} color="info" variant="outlined" />;
+  }
+  switch (check.conclusion) {
+    case 'success':
+      return <Chip size="small" label="success" color="success" />;
+    case 'failure':
+    case 'timed_out':
+    case 'startup_failure':
+    case 'action_required':
+      return <Chip size="small" label={check.conclusion} color="error" />;
+    case 'cancelled':
+    case 'skipped':
+    case 'neutral':
+    case 'stale':
+      return <Chip size="small" label={check.conclusion} variant="outlined" />;
+    default:
+      return <Chip size="small" label={check.conclusion ?? '—'} variant="outlined" />;
+  }
+}
+
+function ChecksPanel({
+  checks,
+  loading,
+  error,
+}: {
+  checks: PrChecks | null;
+  loading: boolean;
+  error: string | null;
+}) {
+  return (
+    <Paper sx={{ p: 2.5 }}>
+      <Stack
+        direction="row"
+        spacing={1}
+        sx={{ mb: 1, alignItems: 'center', justifyContent: 'space-between' }}
+      >
+        <Typography variant="h6">Checks</Typography>
+        {checks ? overallCheckChip(checks.state) : null}
+      </Stack>
+
+      {loading && !checks ? (
+        <LoadingBlock rows={3} />
+      ) : error && !checks ? (
+        <Typography variant="body2" color="error">
+          {error}
+        </Typography>
+      ) : !checks || checks.checks.length === 0 ? (
+        <Typography variant="body2" color="text.secondary">
+          No checks reported for this head commit.
+        </Typography>
+      ) : (
+        <>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+            Head {checks.shortSha}
+            {checks.state === 'pending' ? ' · polling for updates…' : ''}
+          </Typography>
+          <List dense disablePadding>
+            {checks.checks.map((check) => (
+              <ListItem
+                key={`${check.id}-${check.name}`}
+                disableGutters
+                secondaryAction={checkStatusChip(check)}
+                sx={{ pr: 12, alignItems: 'flex-start', py: 0.75 }}
+              >
+                <ListItemText
+                  primary={
+                    <Typography variant="body2">
+                      {check.htmlUrl ? (
+                        <Link href={check.htmlUrl} target="_blank" rel="noreferrer" underline="hover">
+                          {check.name}
+                        </Link>
+                      ) : (
+                        check.name
+                      )}
+                    </Typography>
+                  }
+                  secondary={
+                    [
+                      check.appName,
+                      check.durationSeconds != null
+                        ? formatDurationSeconds(check.durationSeconds)
+                        : null,
+                    ]
+                      .filter(Boolean)
+                      .join(' · ') || undefined
+                  }
+                />
+              </ListItem>
+            ))}
+          </List>
+        </>
+      )}
+    </Paper>
+  );
+}
 
 export default function PrDetailPage() {
   const { number } = useParams();
   const prNumber = Number(number);
   const { data, error, loading } = useAsyncData(() => api.pr(prNumber), [prNumber]);
+  const {
+    data: checks,
+    error: checksError,
+    loading: checksLoading,
+  } = useAsyncData(() => api.prChecks(prNumber), [prNumber], {
+    pollInterval: (result) => (result.state === 'pending' ? CHECKS_POLL_MS : null),
+  });
 
   if (loading) return <LoadingBlock />;
   if (error || !data) return <ErrorState message={error ?? 'PR not found'} />;
@@ -54,9 +175,10 @@ export default function PrDetailPage() {
         }
       />
 
-      <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+      <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
         {data.merged ? <Chip label="merged" color="secondary" /> : <Chip label={data.state} />}
         {data.draft ? <Chip label="draft" variant="outlined" /> : null}
+        {checks ? overallCheckChip(checks.state) : null}
         {data.labels.map((l) => (
           <Chip key={l} label={l} size="small" variant="outlined" />
         ))}
@@ -91,12 +213,13 @@ export default function PrDetailPage() {
 
       <Grid container spacing={2}>
         <Grid size={{ xs: 12, md: 7 }}>
-          <Paper sx={{ p: 2.5 }}>
+          <Paper sx={{ p: 2.5, mb: 2 }}>
             <Typography variant="h6" gutterBottom>
               Description
             </Typography>
             <MarkdownContent content={data.body} empty="No description." />
           </Paper>
+          <ChecksPanel checks={checks} loading={checksLoading} error={checksError} />
         </Grid>
         <Grid size={{ xs: 12, md: 5 }}>
           <Paper sx={{ p: 2.5, mb: 2 }}>

@@ -62,6 +62,19 @@ export function createApp(options: CreateAppOptions): Express {
     }
   });
 
+  app.get('/api/prs/:number/checks', async (req, res, next) => {
+    try {
+      const number = Number(req.params.number);
+      if (!Number.isFinite(number)) {
+        res.status(400).json({ error: 'Invalid PR number' });
+        return;
+      }
+      res.json(await github.getPullRequestChecks(number));
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.get('/api/commits', async (_req, res, next) => {
     try {
       const [items, stats] = await Promise.all([github.listCommits(), github.getCommitStats()]);

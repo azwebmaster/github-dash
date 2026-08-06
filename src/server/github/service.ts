@@ -4,6 +4,8 @@ import type {
   CommitStats,
   CommitSummary,
   OverviewStats,
+  PrCheck,
+  PrChecks,
   PrDetail,
   PrStats,
   PrSummary,
@@ -19,6 +21,7 @@ import {
   computeTimingStats,
   hoursBetween,
   parsePrNumbersFromReleaseNotes,
+  rollupCheckState,
   round,
   secondsBetween,
 } from '../../shared/utils.js';
@@ -217,11 +220,103 @@ export class GitHubService {
       htmlUrl: pr.html_url,
       body: pr.body,
       commits: commits.length,
+      headSha: pr.head.sha,
       reviewers,
       requestedReviewers: (pr.requested_reviewers ?? [])
         .map((u) => ('login' in u ? u.login : null))
         .filter((x): x is string => Boolean(x)),
       timeline,
+    };
+  }
+
+  async getPullRequestChecks(number: number): Promise<PrChecks> {
+    const { data: pr } = await this.octokit.pulls.get({
+      owner: this.ref.owner,
+      repo: this.ref.repo,
+      pull_number: number,
+    });
+
+    const headSha = pr.head.sha;
+    const checks: PrCheck[] = [];
+
+    try {
+      const { data } = await this.octokit.checks.listForRef({
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        ref: headSha,
+        per_page: 100,
+      });
+
+      for (const run of data.check_runs) {
+        checks.push({
+          id: run.id,
+          name: run.name,
+          status: run.status,
+          conclusion: run.conclusion,
+          startedAt: run.started_at ?? null,
+          completedAt: run.completed_at ?? null,
+          durationSeconds: secondsBetween(run.started_at, run.completed_at),
+          htmlUrl: run.html_url ?? run.details_url ?? null,
+          appName: run.app?.name ?? null,
+        });
+      }
+    } catch {
+      // Checks API can 403 without Actions/checks permission; fall through to statuses.
+    }
+
+    const checkNames = new Set(checks.map((c) => c.name.toLowerCase()));
+
+    try {
+      const { data: combined } = await this.octokit.repos.getCombinedStatusForRef({
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        ref: headSha,
+      });
+
+      for (const status of combined.statuses) {
+        const name = status.context || 'status';
+        if (checkNames.has(name.toLowerCase())) continue;
+        const state = status.state;
+        const completed = state !== 'pending';
+        checks.push({
+          id: status.id,
+          name,
+          status: completed ? 'completed' : 'in_progress',
+          conclusion: completed
+            ? state === 'success'
+              ? 'success'
+              : state === 'failure'
+                ? 'failure'
+                : state === 'error'
+                  ? 'failure'
+                  : 'neutral'
+            : null,
+          startedAt: status.created_at ?? null,
+          completedAt: completed ? (status.updated_at ?? null) : null,
+          durationSeconds: completed
+            ? secondsBetween(status.created_at, status.updated_at)
+            : null,
+          htmlUrl: status.target_url ?? null,
+          appName: null,
+        });
+      }
+    } catch {
+      // Statuses may be unavailable; check runs alone are still useful.
+    }
+
+    checks.sort((a, b) => {
+      const aPending = a.status !== 'completed' ? 0 : 1;
+      const bPending = b.status !== 'completed' ? 0 : 1;
+      if (aPending !== bPending) return aPending - bPending;
+      return a.name.localeCompare(b.name);
+    });
+
+    return {
+      headSha,
+      shortSha: headSha.slice(0, 7),
+      state: rollupCheckState(checks),
+      totalCount: checks.length,
+      checks,
     };
   }
 
