@@ -462,6 +462,41 @@ export class GitHubService {
     };
   }
 
+  private mapWorkflowRun(run: {
+    id: number;
+    name?: string | null;
+    display_title?: string | null;
+    workflow_id: number;
+    status?: string | null;
+    conclusion?: string | null;
+    event: string;
+    head_branch?: string | null;
+    created_at: string;
+    updated_at: string;
+    run_started_at?: string | null;
+    html_url: string;
+    run_attempt?: number | null;
+  }): WorkflowRunSummary {
+    const started = run.run_started_at ?? run.created_at;
+    const ended = run.status === 'completed' ? run.updated_at : null;
+    return {
+      id: run.id,
+      name: run.name ?? run.display_title ?? 'Workflow',
+      workflowId: run.workflow_id,
+      workflowName: run.name ?? String(run.workflow_id),
+      status: run.status ?? null,
+      conclusion: run.conclusion ?? null,
+      event: run.event,
+      branch: run.head_branch ?? '',
+      createdAt: run.created_at,
+      updatedAt: run.updated_at,
+      runStartedAt: run.run_started_at ?? null,
+      durationSeconds: secondsBetween(started, ended),
+      htmlUrl: run.html_url,
+      attempt: run.run_attempt ?? 1,
+    };
+  }
+
   async listWorkflowRuns(force = false): Promise<WorkflowRunSummary[]> {
     if (this.workflowCache && !force) return this.workflowCache;
 
@@ -471,28 +506,40 @@ export class GitHubService {
       per_page: 100,
     });
 
-    this.workflowCache = data.workflow_runs.map((run) => {
-      const started = run.run_started_at ?? run.created_at;
-      const ended = run.status === 'completed' ? run.updated_at : null;
-      return {
-        id: run.id,
-        name: run.name ?? run.display_title ?? 'Workflow',
-        workflowId: run.workflow_id,
-        workflowName: run.name ?? String(run.workflow_id),
-        status: run.status ?? null,
-        conclusion: run.conclusion ?? null,
-        event: run.event,
-        branch: run.head_branch ?? '',
-        createdAt: run.created_at,
-        updatedAt: run.updated_at,
-        runStartedAt: run.run_started_at ?? null,
-        durationSeconds: secondsBetween(started, ended),
-        htmlUrl: run.html_url,
-        attempt: run.run_attempt ?? 1,
-      } satisfies WorkflowRunSummary;
+    this.workflowCache = data.workflow_runs.map((run) => this.mapWorkflowRun(run));
+    return this.workflowCache;
+  }
+
+  /** Past 100 runs for a single workflow definition (not repo-wide). */
+  async listRunsForWorkflow(workflowId: number): Promise<{
+    workflowId: number;
+    name: string;
+    items: WorkflowRunSummary[];
+  }> {
+    const { data } = await this.octokit.actions.listWorkflowRuns({
+      owner: this.ref.owner,
+      repo: this.ref.repo,
+      workflow_id: workflowId,
+      per_page: 100,
     });
 
-    return this.workflowCache;
+    const items = data.workflow_runs.map((run) => this.mapWorkflowRun(run));
+    let name = items[0]?.workflowName;
+
+    if (!name) {
+      try {
+        const { data: workflow } = await this.octokit.actions.getWorkflow({
+          owner: this.ref.owner,
+          repo: this.ref.repo,
+          workflow_id: workflowId,
+        });
+        name = workflow.name;
+      } catch {
+        name = `Workflow ${workflowId}`;
+      }
+    }
+
+    return { workflowId, name, items };
   }
 
   async getWorkflowStats(): Promise<WorkflowStats> {
@@ -572,24 +619,7 @@ export class GitHubService {
         repo: this.ref.repo,
         run_id: id,
       });
-      const started = run.run_started_at ?? run.created_at;
-      const ended = run.status === 'completed' ? run.updated_at : null;
-      base = {
-        id: run.id,
-        name: run.name ?? 'Workflow',
-        workflowId: run.workflow_id,
-        workflowName: run.name ?? String(run.workflow_id),
-        status: run.status ?? null,
-        conclusion: run.conclusion ?? null,
-        event: run.event,
-        branch: run.head_branch ?? '',
-        createdAt: run.created_at,
-        updatedAt: run.updated_at,
-        runStartedAt: run.run_started_at ?? null,
-        durationSeconds: secondsBetween(started, ended),
-        htmlUrl: run.html_url,
-        attempt: run.run_attempt ?? 1,
-      };
+      base = this.mapWorkflowRun(run);
     }
 
     const { data: jobsData } = await this.octokit.actions.listJobsForWorkflowRun({

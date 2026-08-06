@@ -48,7 +48,7 @@ export default function WorkflowsPage() {
     <Stack spacing={3}>
       <PageHeader
         title="Workflows"
-        subtitle="Click a workflow to see its runs, then open a run for job and step timings"
+        subtitle="Click a workflow to see its past 100 runs, then open a run for job and step timings"
       />
 
       <Grid container spacing={2}>

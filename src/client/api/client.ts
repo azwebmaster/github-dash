@@ -39,5 +39,9 @@ export const api = {
   releases: () => request<{ items: ReleaseSummary[]; stats: ReleaseStats }>('/api/releases'),
   release: (id: number) => request<ReleaseDetail>(`/api/releases/${id}`),
   workflows: () => request<{ items: WorkflowRunSummary[]; stats: WorkflowStats }>('/api/workflows'),
+  workflowRuns: (workflowId: number) =>
+    request<{ workflowId: number; name: string; items: WorkflowRunSummary[] }>(
+      `/api/workflows/by/${workflowId}`,
+    ),
   workflow: (id: number) => request<WorkflowRunDetail>(`/api/workflows/${id}`),
 };

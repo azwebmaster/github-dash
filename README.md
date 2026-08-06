@@ -64,7 +64,7 @@ Vite serves the UI on `:5173` and proxies `/api` to the Express server on `:3847
 - **Pull requests** — list with merge timing (avg / median / p90), drill into description, reviewers, timeline
 - **Commits** — recent history, verification, author stats, file-level drill-down
 - **Releases** — publish cadence timing; release notes parsed for `#123` / PR URLs; associated PRs listed on the detail page
-- **Workflows** — Actions success rate and duration stats; click a workflow to see its runs, then open a run for job/step timings with longest job and step highlighted
+- **Workflows** — Actions success rate and duration stats; click a workflow to see its past 100 runs, then open a run for job/step timings with longest job and step highlighted
 
 ## API
 
@@ -79,4 +79,5 @@ Vite serves the UI on `:5173` and proxies `/api` to the Express server on `:3847
 | `GET /api/releases` | Release list + stats |
 | `GET /api/releases/:id` | Release detail + linked PRs |
 | `GET /api/workflows` | Workflow runs + metrics (includes per-workflow ids for drill-down) |
+| `GET /api/workflows/by/:workflowId` | Past 100 runs for a selected workflow |
 | `GET /api/workflows/:id` | Run detail with jobs/steps and durations |
