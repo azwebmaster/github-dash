@@ -9,7 +9,7 @@ import {
   TableContainer,
   TableHead,
   TableRow,
-  Grid2 as Grid,
+  Grid,
 } from '@mui/material';
 import { Link as RouterLink } from 'react-router-dom';
 import { api } from '../api/client';
