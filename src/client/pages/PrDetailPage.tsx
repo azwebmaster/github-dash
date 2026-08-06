@@ -15,6 +15,7 @@ import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import { Link as RouterLink, useParams } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
+import { MarkdownContent } from '../components/MarkdownContent';
 import { ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
 import { formatDurationHours } from '../../shared/utils';
 
@@ -94,18 +95,7 @@ export default function PrDetailPage() {
             <Typography variant="h6" gutterBottom>
               Description
             </Typography>
-            <Typography
-              component="pre"
-              variant="body2"
-              sx={{
-                whiteSpace: 'pre-wrap',
-                fontFamily: '"IBM Plex Sans", sans-serif',
-                m: 0,
-                color: data.body ? 'text.primary' : 'text.secondary',
-              }}
-            >
-              {data.body || 'No description.'}
-            </Typography>
+            <MarkdownContent content={data.body} empty="No description." />
           </Paper>
         </Grid>
         <Grid size={{ xs: 12, md: 5 }}>
