@@ -2,7 +2,11 @@
 import { Command } from 'commander';
 import open from 'open';
 import { createApp } from './server/app.js';
-import { parseRepoArg } from './shared/utils.js';
+import {
+  DEFAULT_RELEASE_WORKFLOW_FILE,
+  normalizeReleaseWorkflowFile,
+  parseRepoArg,
+} from './shared/utils.js';
 
 const program = new Command();
 
@@ -12,9 +16,18 @@ program
   .argument('<repo>', 'GitHub repository as owner/repo (or full github.com URL)')
   .option('-p, --port <port>', 'HTTP port', '3847')
   .option('-t, --token <token>', 'GitHub token (defaults to GITHUB_TOKEN env)')
+  .option(
+    '-r, --release-workflow <file>',
+    'Actions workflow file that creates releases (defaults to RELEASE_WORKFLOW env or release.yml)',
+    process.env.RELEASE_WORKFLOW ?? DEFAULT_RELEASE_WORKFLOW_FILE,
+  )
   .option('--no-open', 'Do not open the browser automatically')
   .option('--host <host>', 'Bind host', '127.0.0.1')
-  .action(async (repoArg: string, opts: { port: string; token?: string; open: boolean; host: string }) => {
+  .action(
+    async (
+      repoArg: string,
+      opts: { port: string; token?: string; open: boolean; host: string; releaseWorkflow: string },
+    ) => {
     let owner: string;
     let repo: string;
     try {
@@ -39,10 +52,12 @@ program
       );
     }
 
-    const app = createApp({ owner, repo, token });
+    const releaseWorkflowFile = normalizeReleaseWorkflowFile(opts.releaseWorkflow);
+    const app = createApp({ owner, repo, token, releaseWorkflowFile });
     const server = app.listen(port, opts.host, async () => {
       const url = `http://${opts.host === '0.0.0.0' ? '127.0.0.1' : opts.host}:${port}`;
       console.log(`GitHub Dash → ${owner}/${repo}`);
+      console.log(`Release workflow → ${releaseWorkflowFile}`);
       console.log(`Listening on ${url}`);
       if (opts.open) {
         try {

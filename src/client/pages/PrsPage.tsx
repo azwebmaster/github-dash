@@ -20,12 +20,16 @@ import {
 import { Link as RouterLink } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
-import { ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
-import { formatDurationHours } from '../../shared/utils';
+import { AgeFilter, ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
+import {
+  DEFAULT_AGE_LOOKBACK_DAYS,
+  formatDurationHours,
+  type AgeLookbackDays,
+} from '../../shared/utils';
 import type { PrSummary } from '../../shared/types';
 
 type StatusFilter = 'all' | 'open' | 'draft' | 'merged' | 'closed';
-type SortKey = 'number' | 'author' | 'status' | 'createdAt' | 'timeToMergeHours' | 'delta';
+type SortKey = 'number' | 'author' | 'status' | 'createdAt' | 'ageHours' | 'delta';
 type SortDir = 'asc' | 'desc';
 
 function statusRank(pr: PrSummary): number {
@@ -65,9 +69,9 @@ function comparePrs(a: PrSummary, b: PrSummary, key: SortKey, dir: SortDir): num
     case 'createdAt':
       cmp = a.createdAt.localeCompare(b.createdAt);
       break;
-    case 'timeToMergeHours': {
-      const ah = a.timeToMergeHours;
-      const bh = b.timeToMergeHours;
+    case 'ageHours': {
+      const ah = a.ageHours;
+      const bh = b.ageHours;
       if (ah == null && bh == null) cmp = 0;
       else if (ah == null) cmp = 1;
       else if (bh == null) cmp = -1;
@@ -83,12 +87,13 @@ function comparePrs(a: PrSummary, b: PrSummary, key: SortKey, dir: SortDir): num
 }
 
 export default function PrsPage() {
-  const { data, error, loading } = useAsyncData(() => api.prs(), []);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [labelFilter, setLabelFilter] = useState<string[]>([]);
+  const [ageFilter, setAgeFilter] = useState<AgeLookbackDays>(DEFAULT_AGE_LOOKBACK_DAYS);
   const [sortKey, setSortKey] = useState<SortKey>('createdAt');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
+  const { data, error, loading } = useAsyncData(() => api.prs(ageFilter), [ageFilter]);
 
   if (loading) return <LoadingBlock rows={8} />;
   if (error || !data) return <ErrorState message={error ?? 'No data'} />;
@@ -129,7 +134,8 @@ export default function PrsPage() {
     );
   };
 
-  const filtersActive = search.trim() !== '' || statusFilter !== 'all' || labelFilter.length > 0;
+  const filtersActive =
+    search.trim() !== '' || statusFilter !== 'all' || labelFilter.length > 0;
 
   return (
     <Stack spacing={3}>
@@ -139,20 +145,27 @@ export default function PrsPage() {
       />
 
       <Grid container spacing={2}>
-        <Grid size={{ xs: 6, md: 3 }}>
+        <Grid size={{ xs: 6, md: 4, lg: 2 }}>
           <StatTile label="Total loaded" value={stats.total} />
         </Grid>
-        <Grid size={{ xs: 6, md: 3 }}>
+        <Grid size={{ xs: 6, md: 4, lg: 2 }}>
           <StatTile label="Open" value={stats.open} hint={`${stats.draft} drafts`} />
         </Grid>
-        <Grid size={{ xs: 6, md: 3 }}>
+        <Grid size={{ xs: 6, md: 4, lg: 2 }}>
           <StatTile
             label="Avg time to merge"
             value={formatDurationHours(stats.mergeTiming.avgHours)}
             hint={`median ${formatDurationHours(stats.mergeTiming.medianHours)} · p90 ${formatDurationHours(stats.mergeTiming.p90Hours)}`}
           />
         </Grid>
-        <Grid size={{ xs: 6, md: 3 }}>
+        <Grid size={{ xs: 6, md: 4, lg: 2 }}>
+          <StatTile
+            label="Avg age"
+            value={formatDurationHours(stats.ageTiming.avgHours)}
+            hint={`median ${formatDurationHours(stats.ageTiming.medianHours)} · p90 ${formatDurationHours(stats.ageTiming.p90Hours)}`}
+          />
+        </Grid>
+        <Grid size={{ xs: 6, md: 4, lg: 2 }}>
           <StatTile
             label="Merged"
             value={stats.merged}
@@ -189,6 +202,7 @@ export default function PrsPage() {
             <MenuItem value="merged">Merged</MenuItem>
             <MenuItem value="closed">Closed</MenuItem>
           </TextField>
+          <AgeFilter value={ageFilter} onChange={setAgeFilter} />
           <Autocomplete
             multiple
             size="small"
@@ -253,13 +267,13 @@ export default function PrsPage() {
                   Created
                 </TableSortLabel>
               </TableCell>
-              <TableCell sortDirection={sortKey === 'timeToMergeHours' ? sortDir : false}>
+              <TableCell sortDirection={sortKey === 'ageHours' ? sortDir : false}>
                 <TableSortLabel
-                  active={sortKey === 'timeToMergeHours'}
-                  direction={sortKey === 'timeToMergeHours' ? sortDir : 'asc'}
-                  onClick={() => handleSort('timeToMergeHours')}
+                  active={sortKey === 'ageHours'}
+                  direction={sortKey === 'ageHours' ? sortDir : 'asc'}
+                  onClick={() => handleSort('ageHours')}
                 >
-                  Time to merge
+                  Age
                 </TableSortLabel>
               </TableCell>
               <TableCell align="right" sortDirection={sortKey === 'delta' ? sortDir : false}>
@@ -344,7 +358,7 @@ export default function PrsPage() {
                   </TableCell>
                   <TableCell>{formatDate(pr.createdAt)}</TableCell>
                   <TableCell sx={{ fontFamily: '"IBM Plex Mono", monospace' }}>
-                    {formatDurationHours(pr.timeToMergeHours)}
+                    {formatDurationHours(pr.ageHours)}
                   </TableCell>
                   <TableCell
                     align="right"

@@ -1,24 +1,48 @@
-import { Grid, Link, Paper, Stack, Typography } from '@mui/material';
+import { useState, type ReactNode } from 'react';
+import { Chip, Grid, Link, List, ListItem, Paper, Stack, Typography } from '@mui/material';
 import { Link as RouterLink } from 'react-router-dom';
 import { BarChart } from '@mui/x-charts/BarChart';
 import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
-import { ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
-import { formatDurationHours, formatDurationSeconds } from '../../shared/utils';
+import { usePinnedWorkflows } from '../hooks/usePinnedWorkflows';
+import { WorkflowSummaryCard } from '../components/WorkflowSummaryCard';
+import { AgeFilter, ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
+import {
+  DEFAULT_AGE_LOOKBACK_DAYS,
+  formatDurationHours,
+  formatDurationSeconds,
+  type AgeLookbackDays,
+} from '../../shared/utils';
+import type { OverviewInsights } from '../../shared/types';
+
+function hasAttention(insights: OverviewInsights): boolean {
+  return (
+    insights.oldestOpenPrs.length > 0 ||
+    insights.attentionWorkflows.length > 0 ||
+    insights.slowestWorkflows.length > 0 ||
+    insights.releaseGapHours != null ||
+    (insights.orchestrationSummary != null && insights.orchestrationSummary.runsWithState > 0)
+  );
+}
 
 export default function OverviewPage() {
-  const { data, error, loading } = useAsyncData(() => api.overview(), []);
+  const [ageFilter, setAgeFilter] = useState<AgeLookbackDays>(DEFAULT_AGE_LOOKBACK_DAYS);
+  const { data, error, loading } = useAsyncData(() => api.overview(ageFilter), [ageFilter]);
+  const { pinnedIds, unpin } = usePinnedWorkflows();
 
-  if (loading) return <LoadingBlock rows={6} />;
+  if (loading && !data) return <LoadingBlock rows={6} />;
   if (error || !data) return <ErrorState message={error ?? 'No data'} />;
 
-  const { repo, prs, commits, releases, workflows } = data;
+  const { repo, prs, commits, releases, workflows, insights } = data;
+  const orch = insights.orchestrationSummary;
+  const nameById = new Map(workflows.byWorkflow.map((w) => [w.workflowId, w.name]));
 
   return (
     <Stack spacing={3}>
       <PageHeader
         title={repo.fullName}
         subtitle={repo.description ?? 'Repository overview — PRs, commits, releases, and Actions'}
+        action={<AgeFilter value={ageFilter} onChange={setAgeFilter} />}
       />
 
       <Grid container spacing={2}>
@@ -36,6 +60,145 @@ export default function OverviewPage() {
         </Grid>
       </Grid>
 
+      {hasAttention(insights) ? (
+        <Paper sx={{ p: 2.5 }}>
+          <Typography variant="h6" gutterBottom>
+            Needs attention
+          </Typography>
+          <Grid container spacing={2}>
+            <Grid size={{ xs: 12, md: 6, lg: 3 }}>
+              <Typography variant="overline" color="text.secondary">
+                Oldest open PRs
+              </Typography>
+              {insights.oldestOpenPrs.length ? (
+                <List dense disablePadding>
+                  {insights.oldestOpenPrs.map((pr) => (
+                    <ListItem key={pr.number} disableGutters sx={{ py: 0.25, display: 'block' }}>
+                      <Link
+                        component={RouterLink}
+                        to={`/prs/${pr.number}`}
+                        underline="hover"
+                        fontWeight={600}
+                        variant="body2"
+                        sx={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      >
+                        #{pr.number} {pr.title}
+                      </Link>
+                      <Typography variant="caption" color="text.secondary">
+                        open {formatDurationHours(pr.ageHours)}
+                      </Typography>
+                    </ListItem>
+                  ))}
+                </List>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  No open PRs in this window.
+                </Typography>
+              )}
+            </Grid>
+
+            <Grid size={{ xs: 12, md: 6, lg: 3 }}>
+              <Typography variant="overline" color="text.secondary">
+                Flaky / failing workflows
+              </Typography>
+              {insights.attentionWorkflows.length ? (
+                <List dense disablePadding>
+                  {insights.attentionWorkflows.map((w) => (
+                    <ListItem key={w.workflowId} disableGutters sx={{ py: 0.25, display: 'block' }}>
+                      <Link
+                        component={RouterLink}
+                        to={`/workflows/by/${w.workflowId}`}
+                        underline="hover"
+                        fontWeight={600}
+                        variant="body2"
+                        sx={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      >
+                        {w.name}
+                      </Link>
+                      <Typography variant="caption" color="text.secondary">
+                        {w.consecutiveFailures > 0
+                          ? `${w.successRate}% ok · ${w.consecutiveFailures} consecutive fail`
+                          : `${w.successRate}% success`}
+                      </Typography>
+                    </ListItem>
+                  ))}
+                </List>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  No workflows need attention.
+                </Typography>
+              )}
+            </Grid>
+
+            <Grid size={{ xs: 12, md: 6, lg: 3 }}>
+              <Typography variant="overline" color="text.secondary">
+                Slowest workflows
+              </Typography>
+              {insights.slowestWorkflows.length ? (
+                <List dense disablePadding>
+                  {insights.slowestWorkflows.map((w) => (
+                    <ListItem key={w.workflowId} disableGutters sx={{ py: 0.25, display: 'block' }}>
+                      <Link
+                        component={RouterLink}
+                        to={`/workflows/by/${w.workflowId}`}
+                        underline="hover"
+                        fontWeight={600}
+                        variant="body2"
+                        sx={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      >
+                        {w.name}
+                      </Link>
+                      <Typography variant="caption" color="text.secondary">
+                        avg {formatDurationSeconds(w.avgDurationSeconds)}
+                      </Typography>
+                    </ListItem>
+                  ))}
+                </List>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  Not enough duration data.
+                </Typography>
+              )}
+            </Grid>
+
+            <Grid size={{ xs: 12, md: 6, lg: 3 }}>
+              <Typography variant="overline" color="text.secondary">
+                Release & train
+              </Typography>
+              <Stack spacing={1} sx={{ mt: 0.5 }}>
+                <Typography variant="body2">
+                  Gap since last release:{' '}
+                  <BoxMono>{formatDurationHours(insights.releaseGapHours)}</BoxMono>
+                </Typography>
+                {orch && orch.runsWithState > 0 ? (
+                  <>
+                    <Typography variant="body2" color="text.secondary">
+                      Orchestration: {orch.runsWithState}/{orch.sampleSize} runs with state
+                    </Typography>
+                    {orch.stageStats.filter((s) => s.failureRate > 0).slice(0, 3).map((s) => (
+                      <Chip
+                        key={s.stageId}
+                        size="small"
+                        color={s.failureRate >= 50 ? 'error' : 'warning'}
+                        label={`${s.name} ${s.failureRate}% fail`}
+                        sx={{ alignSelf: 'flex-start' }}
+                      />
+                    ))}
+                    <Link component={RouterLink} to="/releases" variant="body2">
+                      View releases →
+                    </Link>
+                  </>
+                ) : (
+                  <Typography variant="body2" color="text.secondary">
+                    No orchestration state in recent release workflow runs.
+                  </Typography>
+                )}
+              </Stack>
+            </Grid>
+          </Grid>
+        </Paper>
+      ) : null}
+
       <Grid container spacing={2}>
         <Grid size={{ xs: 12, md: 6, lg: 3 }}>
           <Paper sx={{ p: 2.5, height: '100%' }}>
@@ -46,7 +209,13 @@ export default function OverviewPage() {
               {prs.total}
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              {prs.open} open · {prs.merged} merged · avg merge {formatDurationHours(prs.mergeTiming.avgHours)}
+              {prs.open} open · {prs.merged} merged
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+              merge avg {formatDurationHours(prs.mergeTiming.avgHours)}
+              {prs.mergeTiming.medianHours != null
+                ? ` · median ${formatDurationHours(prs.mergeTiming.medianHours)} · p90 ${formatDurationHours(prs.mergeTiming.p90Hours)}`
+                : ''}
             </Typography>
             <Link component={RouterLink} to="/prs" sx={{ mt: 1.5, display: 'inline-block' }}>
               View PRs →
@@ -78,7 +247,11 @@ export default function OverviewPage() {
               {releases.total}
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              cadence {formatDurationHours(releases.releaseCadence.avgHours)} · {releases.associatedPrTotal} PRs in notes
+              cadence {formatDurationHours(releases.releaseCadence.avgHours)} · {releases.associatedPrTotal} PRs in
+              notes
+              {releases.creatingRunsMatched
+                ? ` · ${releases.creatingRunSuccessRate}% ${releases.creatingWorkflowFile} success`
+                : ''}
             </Typography>
             <Link component={RouterLink} to="/releases" sx={{ mt: 1.5, display: 'inline-block' }}>
               View releases →
@@ -94,7 +267,11 @@ export default function OverviewPage() {
               {workflows.successRate}%
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              success · avg run {formatDurationSeconds((workflows.duration.avgHours ?? 0) * 3600 || null)} · {workflows.totalRuns} runs
+              success · avg run {formatDurationSeconds((workflows.duration.avgHours ?? 0) * 3600 || null)} ·{' '}
+              {workflows.totalRuns} runs
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+              p90 {formatDurationSeconds((workflows.duration.p90Hours ?? 0) * 3600 || null)}
             </Typography>
             <Link component={RouterLink} to="/workflows" sx={{ mt: 1.5, display: 'inline-block' }}>
               View workflows →
@@ -103,56 +280,54 @@ export default function OverviewPage() {
         </Grid>
       </Grid>
 
-      <Grid container spacing={2}>
-        <Grid size={{ xs: 12, lg: 6 }}>
-          <Paper sx={{ p: 2 }}>
-            <Typography variant="h6" gutterBottom>
-              Commits per day
-            </Typography>
-            {commits.commitsPerDay.length ? (
-              <BarChart
-                height={260}
-                series={[{ data: commits.commitsPerDay.map((d) => d.count), label: 'Commits', color: '#0F4C5C' }]}
-                xAxis={[
-                  {
-                    data: commits.commitsPerDay.map((d) => d.date.slice(5)),
-                    scaleType: 'band',
-                  },
-                ]}
-                margin={{ left: 40, right: 10, top: 20, bottom: 40 }}
-              />
-            ) : (
-              <Typography color="text.secondary">No commit activity loaded.</Typography>
-            )}
-          </Paper>
-        </Grid>
-        <Grid size={{ xs: 12, lg: 6 }}>
-          <Paper sx={{ p: 2 }}>
-            <Typography variant="h6" gutterBottom>
-              Workflow conclusions
-            </Typography>
-            {workflows.recentConclusions.length ? (
-              <BarChart
-                height={260}
-                series={[
-                  { data: workflows.recentConclusions.map((d) => d.success), label: 'Success', color: '#0F7B4B', stack: 't' },
-                  { data: workflows.recentConclusions.map((d) => d.failure), label: 'Failure', color: '#C62828', stack: 't' },
-                  { data: workflows.recentConclusions.map((d) => d.other), label: 'Other', color: '#3D5560', stack: 't' },
-                ]}
-                xAxis={[
-                  {
-                    data: workflows.recentConclusions.map((d) => d.date.slice(5)),
-                    scaleType: 'band',
-                  },
-                ]}
-                margin={{ left: 40, right: 10, top: 20, bottom: 40 }}
-              />
-            ) : (
-              <Typography color="text.secondary">No workflow runs loaded.</Typography>
-            )}
-          </Paper>
-        </Grid>
-      </Grid>
+      {pinnedIds.length > 0 ? (
+        <Stack spacing={1.5}>
+          <Typography variant="h6">Pinned workflows</Typography>
+          <Typography variant="body2" color="text.secondary">
+            Pin from the Workflows page. Cards reuse the same cookie as that view.
+          </Typography>
+          <Grid container spacing={2}>
+            {pinnedIds.map((id) => (
+              <Grid key={id} size={{ xs: 12, sm: 6, lg: 4 }}>
+                <WorkflowSummaryCard
+                  workflowId={id}
+                  fallbackName={nameById.get(id)}
+                  onRemove={() => unpin(id)}
+                />
+              </Grid>
+            ))}
+          </Grid>
+        </Stack>
+      ) : null}
+
+      <Paper sx={{ p: 2 }}>
+        <Typography variant="h6" gutterBottom>
+          Commits per day
+        </Typography>
+        {commits.commitsPerDay.length ? (
+          <BarChart
+            height={260}
+            series={[{ data: commits.commitsPerDay.map((d) => d.count), label: 'Commits', color: '#0F4C5C' }]}
+            xAxis={[
+              {
+                data: commits.commitsPerDay.map((d) => d.date.slice(5)),
+                scaleType: 'band',
+              },
+            ]}
+            margin={{ left: 40, right: 10, top: 20, bottom: 40 }}
+          />
+        ) : (
+          <Typography color="text.secondary">No commit activity in this window.</Typography>
+        )}
+      </Paper>
     </Stack>
+  );
+}
+
+function BoxMono({ children }: { children: ReactNode }) {
+  return (
+    <Typography component="span" sx={{ fontFamily: '"IBM Plex Mono", monospace' }}>
+      {children}
+    </Typography>
   );
 }

@@ -2,6 +2,14 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import cors from 'cors';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  DEFAULT_AGE_LOOKBACK_DAYS,
+  DEFAULT_RELEASE_WORKFLOW_FILE,
+  DEFAULT_RUN_LIMIT,
+  normalizeReleaseWorkflowFile,
+  parseAgeLookbackParam,
+  parseRunLimitParam,
+} from '../shared/utils.js';
 import { GitHubService } from './github/service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -11,16 +19,27 @@ export interface CreateAppOptions {
   repo: string;
   token?: string;
   staticDir?: string;
+  /** Prefetch default lookback on boot (default true). */
+  warmCache?: boolean;
+  /** Actions workflow file that creates releases (default `release.yml`). */
+  releaseWorkflowFile?: string;
 }
 
 export function createApp(options: CreateAppOptions): Express {
   const app = express();
+  const releaseWorkflowFile = normalizeReleaseWorkflowFile(
+    options.releaseWorkflowFile ?? process.env.RELEASE_WORKFLOW ?? DEFAULT_RELEASE_WORKFLOW_FILE,
+  );
   const github = new GitHubService({
     owner: options.owner,
     repo: options.repo,
     token: options.token,
+    releaseWorkflowFile,
   });
 
+  if (options.warmCache !== false) {
+    github.warmDefaults();
+  }
   app.use(cors());
   app.use(express.json());
 
@@ -29,20 +48,35 @@ export function createApp(options: CreateAppOptions): Express {
   });
 
   app.get('/api/meta', (_req, res) => {
-    res.json({ owner: options.owner, repo: options.repo });
+    res.json({
+      owner: options.owner,
+      repo: options.repo,
+      releaseWorkflowFile: github.releaseWorkflowFile,
+    });
   });
 
-  app.get('/api/overview', async (_req, res, next) => {
+  app.get('/api/overview', async (req, res, next) => {
     try {
-      res.json(await github.getOverview());
+      const days =
+        req.query.days === undefined
+          ? DEFAULT_AGE_LOOKBACK_DAYS
+          : parseAgeLookbackParam(req.query.days);
+      res.json(await github.getOverview(days));
     } catch (err) {
       next(err);
     }
   });
 
-  app.get('/api/prs', async (_req, res, next) => {
+  app.get('/api/prs', async (req, res, next) => {
     try {
-      const [items, stats] = await Promise.all([github.listPullRequests(), github.getPrStats()]);
+      const days =
+        req.query.days === undefined
+          ? DEFAULT_AGE_LOOKBACK_DAYS
+          : parseAgeLookbackParam(req.query.days);
+      const [items, stats] = await Promise.all([
+        github.listPullRequests(days),
+        github.getPrStats(days),
+      ]);
       res.json({ items, stats });
     } catch (err) {
       next(err);
@@ -75,9 +109,16 @@ export function createApp(options: CreateAppOptions): Express {
     }
   });
 
-  app.get('/api/commits', async (_req, res, next) => {
+  app.get('/api/commits', async (req, res, next) => {
     try {
-      const [items, stats] = await Promise.all([github.listCommits(), github.getCommitStats()]);
+      const days =
+        req.query.days === undefined
+          ? DEFAULT_AGE_LOOKBACK_DAYS
+          : parseAgeLookbackParam(req.query.days);
+      const [items, stats] = await Promise.all([
+        github.listCommits(days),
+        github.getCommitStats(days),
+      ]);
       res.json({ items, stats });
     } catch (err) {
       next(err);
@@ -92,9 +133,16 @@ export function createApp(options: CreateAppOptions): Express {
     }
   });
 
-  app.get('/api/releases', async (_req, res, next) => {
+  app.get('/api/releases', async (req, res, next) => {
     try {
-      const [items, stats] = await Promise.all([github.listReleases(), github.getReleaseStats()]);
+      const days =
+        req.query.days === undefined
+          ? DEFAULT_AGE_LOOKBACK_DAYS
+          : parseAgeLookbackParam(req.query.days);
+      const [items, stats] = await Promise.all([
+        github.listReleases(days),
+        github.getReleaseStats(days),
+      ]);
       res.json({ items, stats });
     } catch (err) {
       next(err);
@@ -114,9 +162,16 @@ export function createApp(options: CreateAppOptions): Express {
     }
   });
 
-  app.get('/api/workflows', async (_req, res, next) => {
+  app.get('/api/workflows', async (req, res, next) => {
     try {
-      const [items, stats] = await Promise.all([github.listWorkflowRuns(), github.getWorkflowStats()]);
+      const limit =
+        req.query.limit === undefined
+          ? DEFAULT_RUN_LIMIT
+          : parseRunLimitParam(req.query.limit);
+      const [items, stats] = await Promise.all([
+        github.listWorkflowRuns(limit),
+        github.getWorkflowStats(limit),
+      ]);
       res.json({ items, stats });
     } catch (err) {
       next(err);
@@ -130,7 +185,11 @@ export function createApp(options: CreateAppOptions): Express {
         res.status(400).json({ error: 'Invalid workflow id' });
         return;
       }
-      res.json(await github.listRunsForWorkflow(workflowId));
+      const limit =
+        req.query.limit === undefined
+          ? DEFAULT_RUN_LIMIT
+          : parseRunLimitParam(req.query.limit);
+      res.json(await github.listRunsForWorkflow(workflowId, limit));
     } catch (err) {
       next(err);
     }
@@ -143,7 +202,22 @@ export function createApp(options: CreateAppOptions): Express {
         res.status(400).json({ error: 'Invalid workflow run id' });
         return;
       }
-      res.json(await github.getWorkflowRun(id));
+      const includeOrchestration = req.query.orchestration !== '0';
+      const owner = typeof req.query.owner === 'string' ? req.query.owner : undefined;
+      const repo = typeof req.query.repo === 'string' ? req.query.repo : undefined;
+      if ((owner && !repo) || (!owner && repo)) {
+        res.status(400).json({ error: 'Both owner and repo are required when overriding repo' });
+        return;
+      }
+      res.json(await github.getWorkflowRun(id, { includeOrchestration, owner, repo }));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/orchestration/health', async (_req, res, next) => {
+    try {
+      res.json(await github.getOrchestrationHealth());
     } catch (err) {
       next(err);
     }

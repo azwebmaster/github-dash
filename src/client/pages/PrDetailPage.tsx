@@ -190,9 +190,13 @@ export default function PrDetailPage() {
         </Grid>
         <Grid size={{ xs: 6, md: 3 }}>
           <StatTile
-            label="Time to merge"
-            value={formatDurationHours(data.timeToMergeHours)}
-            hint={`created ${formatDate(data.createdAt)}`}
+            label="Age"
+            value={formatDurationHours(data.ageHours)}
+            hint={
+              data.merged && data.timeToMergeHours != null
+                ? `time to merge ${formatDurationHours(data.timeToMergeHours)}`
+                : `created ${formatDate(data.createdAt)}`
+            }
           />
         </Grid>
         <Grid size={{ xs: 6, md: 3 }}>

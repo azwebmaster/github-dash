@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import {
   Chip,
   Link,
@@ -15,10 +16,15 @@ import {
 import { Link as RouterLink } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
-import { ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
+import { AgeFilter, ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
+import {
+  DEFAULT_AGE_LOOKBACK_DAYS,
+  type AgeLookbackDays,
+} from '../../shared/utils';
 
 export default function CommitsPage() {
-  const { data, error, loading } = useAsyncData(() => api.commits(), []);
+  const [ageFilter, setAgeFilter] = useState<AgeLookbackDays>(DEFAULT_AGE_LOOKBACK_DAYS);
+  const { data, error, loading } = useAsyncData(() => api.commits(ageFilter), [ageFilter]);
 
   if (loading) return <LoadingBlock rows={8} />;
   if (error || !data) return <ErrorState message={error ?? 'No data'} />;
@@ -55,6 +61,15 @@ export default function CommitsPage() {
         </Grid>
       </Grid>
 
+      <Paper sx={{ p: 2 }}>
+        <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} sx={{ alignItems: { md: 'center' } }}>
+          <AgeFilter value={ageFilter} onChange={setAgeFilter} />
+          <Typography variant="body2" color="text.secondary">
+            Showing {items.length} commit{items.length === 1 ? '' : 's'}
+          </Typography>
+        </Stack>
+      </Paper>
+
       <TableContainer component={Paper}>
         <Table size="small">
           <TableHead>
@@ -67,36 +82,46 @@ export default function CommitsPage() {
             </TableRow>
           </TableHead>
           <TableBody>
-            {items.map((c) => (
-              <TableRow key={c.sha} hover>
-                <TableCell>
-                  <Link
-                    component={RouterLink}
-                    to={`/commits/${c.sha}`}
-                    underline="hover"
-                    sx={{ fontFamily: '"IBM Plex Mono", monospace' }}
-                  >
-                    {c.shortSha}
-                  </Link>
-                </TableCell>
-                <TableCell>
-                  <Link component={RouterLink} to={`/commits/${c.sha}`} underline="hover" color="inherit">
-                    {c.message}
-                  </Link>
-                </TableCell>
-                <TableCell sx={{ fontFamily: '"IBM Plex Mono", monospace' }}>
-                  {c.authorLogin ?? c.authorName ?? '—'}
-                </TableCell>
-                <TableCell>{formatDate(c.authorDate)}</TableCell>
-                <TableCell>
-                  {c.verified ? (
-                    <Chip size="small" label="verified" color="success" variant="outlined" />
-                  ) : (
-                    <Chip size="small" label="unsigned" variant="outlined" />
-                  )}
+            {items.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={5}>
+                  <Typography variant="body2" color="text.secondary" sx={{ py: 2, textAlign: 'center' }}>
+                    No commits match the current age filter.
+                  </Typography>
                 </TableCell>
               </TableRow>
-            ))}
+            ) : (
+              items.map((c) => (
+                <TableRow key={c.sha} hover>
+                  <TableCell>
+                    <Link
+                      component={RouterLink}
+                      to={`/commits/${c.sha}`}
+                      underline="hover"
+                      sx={{ fontFamily: '"IBM Plex Mono", monospace' }}
+                    >
+                      {c.shortSha}
+                    </Link>
+                  </TableCell>
+                  <TableCell>
+                    <Link component={RouterLink} to={`/commits/${c.sha}`} underline="hover" color="inherit">
+                      {c.message}
+                    </Link>
+                  </TableCell>
+                  <TableCell sx={{ fontFamily: '"IBM Plex Mono", monospace' }}>
+                    {c.authorLogin ?? c.authorName ?? '—'}
+                  </TableCell>
+                  <TableCell>{formatDate(c.authorDate)}</TableCell>
+                  <TableCell>
+                    {c.verified ? (
+                      <Chip size="small" label="verified" color="success" variant="outlined" />
+                    ) : (
+                      <Chip size="small" label="unsigned" variant="outlined" />
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
           </TableBody>
         </Table>
       </TableContainer>

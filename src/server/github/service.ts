@@ -3,43 +3,120 @@ import type {
   CommitDetail,
   CommitStats,
   CommitSummary,
+  OrchestrationHealthSummary,
+  OverviewInsights,
   OverviewStats,
   PrCheck,
   PrChecks,
   PrDetail,
   PrStats,
   PrSummary,
+  ReleaseCreatingRunSummary,
   ReleaseDetail,
   ReleaseStats,
   ReleaseSummary,
   RepoRef,
+  WorkflowConclusionKind,
   WorkflowRunDetail,
   WorkflowRunSummary,
   WorkflowStats,
 } from '../../shared/types.js';
 import {
+  ageLookbackCutoffIso,
   computeTimingStats,
+  DEFAULT_AGE_LOOKBACK_DAYS,
+  DEFAULT_RELEASE_WORKFLOW_FILE,
+  DEFAULT_RUN_LIMIT,
   hoursBetween,
+  isWithinAgeLookback,
+  matchReleaseCreatingRun,
+  normalizeReleaseWorkflowFile,
   parsePrNumbersFromReleaseNotes,
+  PER_WORKFLOW_RUN_SAMPLE,
   rollupCheckState,
   round,
   secondsBetween,
+  type AgeLookbackDays,
+  type RunLimit,
 } from '../../shared/utils.js';
+import { createCache, resolveCacheTtlMs, resolveMaxPages, type CacheStore } from '../cache/index.js';
+import { loadOrchestrationFromArtifacts } from './orchestration.js';
+import { fetchRecentRunsPerWorkflowGraphql } from './workflow-runs-graphql.js';
+
+const CI_RECENT_CONCLUSION_COUNT = 12;
+const ORCHESTRATION_HEALTH_SAMPLE = 10;
+const ORCHESTRATION_HEALTH_CONCURRENCY = 3;
+/** Stage.State === 3 success, === 4 failure (Go enum). */
+const ORCH_STAGE_SUCCESS = 3;
+const ORCH_STAGE_FAILURE = 4;
+
+function conclusionKind(conclusion: string | null): WorkflowConclusionKind {
+  if (conclusion === 'success') return 'success';
+  if (conclusion === 'failure' || conclusion === 'timed_out' || conclusion === 'startup_failure') {
+    return 'failure';
+  }
+  if (conclusion === 'cancelled') return 'cancelled';
+  return 'other';
+}
+
+function countConsecutiveFailures(runsNewestFirst: WorkflowRunSummary[]): number {
+  let n = 0;
+  for (const run of runsNewestFirst) {
+    if (run.status != null && run.status !== 'completed') continue;
+    const kind = conclusionKind(run.conclusion);
+    if (kind === 'failure') {
+      n += 1;
+      continue;
+    }
+    if (kind === 'success') break;
+    // cancelled / other do not break the streak or count
+  }
+  return n;
+}
+
+async function mapPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next;
+      next += 1;
+      results[i] = await fn(items[i]!);
+    }
+  }
+  const workers = Array.from({ length: Math.min(concurrency, Math.max(items.length, 1)) }, () =>
+    worker(),
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 export interface GitHubServiceOptions {
   token?: string;
   owner: string;
   repo: string;
+  /** Optional cache backend (defaults to in-memory). */
+  cache?: CacheStore;
+  /** Cache TTL in ms (defaults to CACHE_TTL_MS / 60s). */
+  cacheTtlMs?: number;
+  /** Max pages per list fetch (100 items/page). Defaults to GITHUB_MAX_PAGES / 20. */
+  maxPages?: number;
+  /** Actions workflow file that creates releases (default `release.yml`). */
+  releaseWorkflowFile?: string;
 }
 
 export class GitHubService {
   private readonly octokit: Octokit;
   readonly ref: RepoRef;
-
-  private prCache: PrSummary[] | null = null;
-  private commitCache: CommitSummary[] | null = null;
-  private releaseCache: ReleaseSummary[] | null = null;
-  private workflowCache: WorkflowRunSummary[] | null = null;
+  readonly releaseWorkflowFile: string;
+  private readonly cache: CacheStore;
+  private readonly cacheTtlMs: number;
+  private readonly maxPages: number;
+  private readonly inflight = new Map<string, Promise<unknown>>();
 
   constructor(options: GitHubServiceOptions) {
     this.octokit = new Octokit({
@@ -47,91 +124,243 @@ export class GitHubService {
       userAgent: 'github-dash',
     });
     this.ref = { owner: options.owner, repo: options.repo };
+    this.releaseWorkflowFile = normalizeReleaseWorkflowFile(
+      options.releaseWorkflowFile ?? process.env.RELEASE_WORKFLOW ?? DEFAULT_RELEASE_WORKFLOW_FILE,
+    );
+    this.cacheTtlMs = options.cacheTtlMs ?? resolveCacheTtlMs();
+    this.cache = options.cache ?? createCache({ defaultTtlMs: this.cacheTtlMs });
+    this.maxPages = options.maxPages ?? resolveMaxPages();
   }
 
-  async getOverview(): Promise<OverviewStats> {
-    const { data: repo } = await this.octokit.repos.get({
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-    });
+  private cacheKey(resource: string, scope: number | string, extra = ''): string {
+    return `${this.ref.owner}/${this.ref.repo}:${resource}:${scope}${extra ? `:${extra}` : ''}`;
+  }
 
-    const [prs, commits, releases, workflows] = await Promise.all([
-      this.getPrStats(),
-      this.getCommitStats(),
-      this.getReleaseStats(),
-      this.getWorkflowStats(),
-    ]);
+  private notePageCap(resource: string, pages: number, itemCount: number): void {
+    if (pages < this.maxPages) return;
+    console.warn(
+      `[github] ${this.ref.owner}/${this.ref.repo} ${resource}: hit page cap (${pages}×100, kept ${itemCount}). Set GITHUB_MAX_PAGES to raise.`,
+    );
+  }
+
+  private cacheDebugEnabled(): boolean {
+    const raw = process.env.CACHE_DEBUG;
+    return raw === '1' || raw === 'true';
+  }
+
+  /** Read-through cache with in-flight dedupe (stampede protection). */
+  private async cached<T>(key: string, load: () => Promise<T>): Promise<T> {
+    const hit = await this.cache.get<T>(key);
+    if (hit !== undefined) {
+      if (this.cacheDebugEnabled()) console.log(`[cache] HIT  ${key}`);
+      return hit;
+    }
+
+    const pending = this.inflight.get(key);
+    if (pending) {
+      if (this.cacheDebugEnabled()) console.log(`[cache] WAIT ${key}`);
+      return pending as Promise<T>;
+    }
+
+    if (this.cacheDebugEnabled()) console.log(`[cache] MISS ${key}`);
+
+    const promise = (async () => {
+      try {
+        const value = await load();
+        await this.cache.set(key, value, this.cacheTtlMs);
+        return value;
+      } finally {
+        this.inflight.delete(key);
+      }
+    })();
+
+    this.inflight.set(key, promise);
+    return promise;
+  }
+
+  /** Prefetch default lookback lists so the first UI navigation is warm. */
+  warmDefaults(days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS): void {
+    void this.getOverview(days)
+      .then(() => this.getOrchestrationHealth())
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`[cache] warmDefaults failed: ${message}`);
+      });
+  }
+
+  async getOverview(days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS): Promise<OverviewStats> {
+    return this.cached(this.cacheKey('overview', days, this.releaseWorkflowFile), async () => {
+      const { data: repo } = await this.octokit.repos.get({
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+      });
+
+      const [prs, commits, releases, workflows, prList, releaseList, orchestrationSummary] =
+        await Promise.all([
+          this.getPrStats(days),
+          this.getCommitStats(days),
+          this.getReleaseStats(days),
+          this.getWorkflowStats(),
+          this.listPullRequests(days),
+          this.listReleases(days),
+          this.getOrchestrationHealth(),
+        ]);
+
+      const insights = this.buildOverviewInsights({
+        prs: prList,
+        workflows,
+        releases: releaseList,
+        orchestrationSummary,
+      });
+
+      return {
+        repo: {
+          fullName: repo.full_name,
+          description: repo.description,
+          htmlUrl: repo.html_url,
+          defaultBranch: repo.default_branch,
+          stars: repo.stargazers_count,
+          forks: repo.forks_count,
+          openIssues: repo.open_issues_count,
+          language: repo.language,
+          pushedAt: repo.pushed_at,
+        },
+        prs,
+        commits,
+        releases,
+        workflows,
+        insights,
+      };
+    });
+  }
+
+  private buildOverviewInsights(input: {
+    prs: PrSummary[];
+    workflows: WorkflowStats;
+    releases: ReleaseSummary[];
+    orchestrationSummary: OrchestrationHealthSummary;
+  }): OverviewInsights {
+    const oldestOpenPrs = input.prs
+      .filter((p) => p.state === 'open')
+      .sort((a, b) => (b.ageHours ?? 0) - (a.ageHours ?? 0))
+      .slice(0, 3)
+      .map((p) => ({
+        number: p.number,
+        title: p.title,
+        ageHours: p.ageHours,
+        htmlUrl: p.htmlUrl,
+      }));
+
+    const withRuns = input.workflows.byWorkflow.filter((w) => w.total >= 3);
+    const attentionWorkflows = [...withRuns]
+      .sort((a, b) => {
+        const flake = b.consecutiveFailures - a.consecutiveFailures;
+        if (flake !== 0) return flake;
+        return a.successRate - b.successRate;
+      })
+      .filter((w) => w.consecutiveFailures > 0 || w.successRate < 85)
+      .slice(0, 5)
+      .map((w) => ({
+        workflowId: w.workflowId,
+        name: w.name,
+        successRate: w.successRate,
+        consecutiveFailures: w.consecutiveFailures,
+        avgDurationSeconds: w.avgDurationSeconds,
+      }));
+
+    const slowestWorkflows = [...withRuns]
+      .filter((w) => w.avgDurationSeconds != null)
+      .sort((a, b) => (b.avgDurationSeconds ?? 0) - (a.avgDurationSeconds ?? 0))
+      .slice(0, 3)
+      .map((w) => ({
+        workflowId: w.workflowId,
+        name: w.name,
+        avgDurationSeconds: w.avgDurationSeconds,
+      }));
+
+    const latestPublished = input.releases
+      .filter((r) => !r.draft && r.publishedAt)
+      .sort((a, b) => (b.publishedAt ?? '').localeCompare(a.publishedAt ?? ''))[0];
+    const releaseGapHours = latestPublished?.publishedAt
+      ? hoursBetween(latestPublished.publishedAt, new Date().toISOString())
+      : null;
 
     return {
-      repo: {
-        fullName: repo.full_name,
-        description: repo.description,
-        htmlUrl: repo.html_url,
-        defaultBranch: repo.default_branch,
-        stars: repo.stargazers_count,
-        forks: repo.forks_count,
-        openIssues: repo.open_issues_count,
-        language: repo.language,
-        pushedAt: repo.pushed_at,
-      },
-      prs,
-      commits,
-      releases,
-      workflows,
+      oldestOpenPrs,
+      attentionWorkflows,
+      slowestWorkflows,
+      releaseGapHours,
+      orchestrationSummary:
+        input.orchestrationSummary.sampleSize > 0 ? input.orchestrationSummary : null,
     };
   }
 
-  async listPullRequests(force = false): Promise<PrSummary[]> {
-    if (this.prCache && !force) return this.prCache;
+  async listPullRequests(days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS): Promise<PrSummary[]> {
+    return this.cached(this.cacheKey('prs', days), async () => {
+      type PrItem = Awaited<ReturnType<typeof this.octokit.pulls.list>>['data'][number];
+      const raw: PrItem[] = [];
 
-    const items: Awaited<ReturnType<typeof this.octokit.pulls.list>>['data'] = [];
-    for await (const page of this.octokit.paginate.iterator(this.octokit.pulls.list, {
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-      state: 'all',
-      sort: 'updated',
-      direction: 'desc',
-      per_page: 100,
-    })) {
-      items.push(...page.data);
-      if (items.length >= 200) break;
-    }
+      // Sort by created so we can stop once items fall outside the lookback window.
+      let pages = 0;
+      for await (const page of this.octokit.paginate.iterator(this.octokit.pulls.list, {
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        state: 'all',
+        sort: 'created',
+        direction: 'desc',
+        per_page: 100,
+      })) {
+        pages += 1;
+        let reachedCutoff = false;
+        for (const pr of page.data) {
+          if (!isWithinAgeLookback(pr.created_at, days)) {
+            reachedCutoff = true;
+            break;
+          }
+          raw.push(pr);
+        }
+        if (reachedCutoff || pages >= this.maxPages) break;
+      }
+      this.notePageCap('prs', pages, raw.length);
 
-    const capped = items.slice(0, 200);
-
-    this.prCache = capped.map((pr) => {
-      const merged = Boolean(pr.merged_at);
-      return {
-        number: pr.number,
-        title: pr.title,
-        state: pr.state as 'open' | 'closed',
-        draft: Boolean(pr.draft),
-        merged,
-        author: pr.user?.login ?? null,
-        createdAt: pr.created_at,
-        updatedAt: pr.updated_at,
-        closedAt: pr.closed_at,
-        mergedAt: pr.merged_at,
-        timeToMergeHours: hoursBetween(pr.created_at, pr.merged_at),
-        timeToCloseHours: hoursBetween(pr.created_at, pr.closed_at),
-        // List endpoint omits diff stats; filled on detail fetch
-        comments: 'comments' in pr && typeof pr.comments === 'number' ? pr.comments : 0,
-        additions: 'additions' in pr && typeof pr.additions === 'number' ? pr.additions : 0,
-        deletions: 'deletions' in pr && typeof pr.deletions === 'number' ? pr.deletions : 0,
-        changedFiles:
-          'changed_files' in pr && typeof pr.changed_files === 'number' ? pr.changed_files : 0,
-        labels: (pr.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name ?? '')).filter(Boolean),
-        base: pr.base.ref,
-        head: pr.head.ref,
-        htmlUrl: pr.html_url,
-      };
+      return raw.map((pr) => {
+        const merged = Boolean(pr.merged_at);
+        return {
+          number: pr.number,
+          title: pr.title,
+          state: pr.state as 'open' | 'closed',
+          draft: Boolean(pr.draft),
+          merged,
+          author: pr.user?.login ?? null,
+          createdAt: pr.created_at,
+          updatedAt: pr.updated_at,
+          closedAt: pr.closed_at,
+          mergedAt: pr.merged_at,
+          ageHours: hoursBetween(
+            pr.created_at,
+            pr.merged_at ?? pr.closed_at ?? new Date().toISOString(),
+          ),
+          timeToCloseHours: hoursBetween(pr.created_at, pr.closed_at),
+          timeToMergeHours: merged ? hoursBetween(pr.created_at, pr.merged_at) : null,
+          // List endpoint omits diff stats; filled on detail fetch
+          comments: 'comments' in pr && typeof pr.comments === 'number' ? pr.comments : 0,
+          additions: 'additions' in pr && typeof pr.additions === 'number' ? pr.additions : 0,
+          deletions: 'deletions' in pr && typeof pr.deletions === 'number' ? pr.deletions : 0,
+          changedFiles:
+            'changed_files' in pr && typeof pr.changed_files === 'number' ? pr.changed_files : 0,
+          labels: (pr.labels ?? [])
+            .map((l) => (typeof l === 'string' ? l : l.name ?? ''))
+            .filter(Boolean),
+          base: pr.base.ref,
+          head: pr.head.ref,
+          htmlUrl: pr.html_url,
+        };
+      });
     });
-
-    return this.prCache;
   }
 
-  async getPrStats(): Promise<PrStats> {
-    const prs = await this.listPullRequests();
+  async getPrStats(days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS): Promise<PrStats> {
+    const prs = await this.listPullRequests(days);
     const open = prs.filter((p) => p.state === 'open').length;
     const closed = prs.filter((p) => p.state === 'closed' && !p.merged).length;
     const merged = prs.filter((p) => p.merged).length;
@@ -151,8 +380,9 @@ export class GitHubService {
       closed,
       merged,
       draft,
-      mergeTiming: computeTimingStats(prs.map((p) => p.timeToMergeHours)),
+      ageTiming: computeTimingStats(prs.map((p) => p.ageHours)),
       closeTiming: computeTimingStats(prs.filter((p) => !p.merged).map((p) => p.timeToCloseHours)),
+      mergeTiming: computeTimingStats(prs.filter((p) => p.merged).map((p) => p.timeToMergeHours)),
       avgAdditions: withDiff.length
         ? round(withDiff.reduce((s, p) => s + p.additions, 0) / withDiff.length)
         : 0,
@@ -170,154 +400,162 @@ export class GitHubService {
   }
 
   async getPullRequest(number: number): Promise<PrDetail> {
-    const { data: pr } = await this.octokit.pulls.get({
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-      pull_number: number,
+    return this.cached(this.cacheKey('pr', number), async () => {
+      const { data: pr } = await this.octokit.pulls.get({
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        pull_number: number,
+      });
+
+      const [{ data: commits }, { data: reviews }, timeline] = await Promise.all([
+        this.octokit.pulls.listCommits({
+          owner: this.ref.owner,
+          repo: this.ref.repo,
+          pull_number: number,
+          per_page: 100,
+        }),
+        this.octokit.pulls.listReviews({
+          owner: this.ref.owner,
+          repo: this.ref.repo,
+          pull_number: number,
+          per_page: 100,
+        }),
+        this.fetchPrTimeline(number),
+      ]);
+
+      const merged = Boolean(pr.merged_at);
+      const reviewers = [
+        ...new Set(reviews.map((r) => r.user?.login).filter((x): x is string => Boolean(x))),
+      ];
+
+      return {
+        number: pr.number,
+        title: pr.title,
+        state: pr.state as 'open' | 'closed',
+        draft: Boolean(pr.draft),
+        merged,
+        author: pr.user?.login ?? null,
+        createdAt: pr.created_at,
+        updatedAt: pr.updated_at,
+        closedAt: pr.closed_at,
+        mergedAt: pr.merged_at,
+        ageHours: hoursBetween(
+          pr.created_at,
+          pr.merged_at ?? pr.closed_at ?? new Date().toISOString(),
+        ),
+        timeToCloseHours: hoursBetween(pr.created_at, pr.closed_at),
+        timeToMergeHours: merged ? hoursBetween(pr.created_at, pr.merged_at) : null,
+        comments: pr.comments,
+        additions: pr.additions,
+        deletions: pr.deletions,
+        changedFiles: pr.changed_files,
+        labels: pr.labels.map((l) => l.name).filter(Boolean),
+        base: pr.base.ref,
+        head: pr.head.ref,
+        htmlUrl: pr.html_url,
+        body: pr.body,
+        commits: commits.length,
+        headSha: pr.head.sha,
+        reviewers,
+        requestedReviewers: (pr.requested_reviewers ?? [])
+          .map((u) => ('login' in u ? u.login : null))
+          .filter((x): x is string => Boolean(x)),
+        timeline,
+      };
     });
-
-    const [{ data: commits }, { data: reviews }, timeline] = await Promise.all([
-      this.octokit.pulls.listCommits({
-        owner: this.ref.owner,
-        repo: this.ref.repo,
-        pull_number: number,
-        per_page: 100,
-      }),
-      this.octokit.pulls.listReviews({
-        owner: this.ref.owner,
-        repo: this.ref.repo,
-        pull_number: number,
-        per_page: 100,
-      }),
-      this.fetchPrTimeline(number),
-    ]);
-
-    const merged = Boolean(pr.merged_at);
-    const reviewers = [
-      ...new Set(reviews.map((r) => r.user?.login).filter((x): x is string => Boolean(x))),
-    ];
-
-    return {
-      number: pr.number,
-      title: pr.title,
-      state: pr.state as 'open' | 'closed',
-      draft: Boolean(pr.draft),
-      merged,
-      author: pr.user?.login ?? null,
-      createdAt: pr.created_at,
-      updatedAt: pr.updated_at,
-      closedAt: pr.closed_at,
-      mergedAt: pr.merged_at,
-      timeToMergeHours: hoursBetween(pr.created_at, pr.merged_at),
-      timeToCloseHours: hoursBetween(pr.created_at, pr.closed_at),
-      comments: pr.comments,
-      additions: pr.additions,
-      deletions: pr.deletions,
-      changedFiles: pr.changed_files,
-      labels: pr.labels.map((l) => l.name).filter(Boolean),
-      base: pr.base.ref,
-      head: pr.head.ref,
-      htmlUrl: pr.html_url,
-      body: pr.body,
-      commits: commits.length,
-      headSha: pr.head.sha,
-      reviewers,
-      requestedReviewers: (pr.requested_reviewers ?? [])
-        .map((u) => ('login' in u ? u.login : null))
-        .filter((x): x is string => Boolean(x)),
-      timeline,
-    };
   }
 
   async getPullRequestChecks(number: number): Promise<PrChecks> {
-    const { data: pr } = await this.octokit.pulls.get({
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-      pull_number: number,
-    });
-
-    const headSha = pr.head.sha;
-    const checks: PrCheck[] = [];
-
-    try {
-      const { data } = await this.octokit.checks.listForRef({
+    return this.cached(this.cacheKey('pr-checks', number), async () => {
+      const { data: pr } = await this.octokit.pulls.get({
         owner: this.ref.owner,
         repo: this.ref.repo,
-        ref: headSha,
-        per_page: 100,
+        pull_number: number,
       });
 
-      for (const run of data.check_runs) {
-        checks.push({
-          id: run.id,
-          name: run.name,
-          status: run.status,
-          conclusion: run.conclusion,
-          startedAt: run.started_at ?? null,
-          completedAt: run.completed_at ?? null,
-          durationSeconds: secondsBetween(run.started_at, run.completed_at),
-          htmlUrl: run.html_url ?? run.details_url ?? null,
-          appName: run.app?.name ?? null,
+      const headSha = pr.head.sha;
+      const checks: PrCheck[] = [];
+
+      try {
+        const { data } = await this.octokit.checks.listForRef({
+          owner: this.ref.owner,
+          repo: this.ref.repo,
+          ref: headSha,
+          per_page: 100,
         });
+
+        for (const run of data.check_runs) {
+          checks.push({
+            id: run.id,
+            name: run.name,
+            status: run.status,
+            conclusion: run.conclusion,
+            startedAt: run.started_at ?? null,
+            completedAt: run.completed_at ?? null,
+            durationSeconds: secondsBetween(run.started_at, run.completed_at),
+            htmlUrl: run.html_url ?? run.details_url ?? null,
+            appName: run.app?.name ?? null,
+          });
+        }
+      } catch {
+        // Checks API can 403 without Actions/checks permission; fall through to statuses.
       }
-    } catch {
-      // Checks API can 403 without Actions/checks permission; fall through to statuses.
-    }
 
-    const checkNames = new Set(checks.map((c) => c.name.toLowerCase()));
+      const checkNames = new Set(checks.map((c) => c.name.toLowerCase()));
 
-    try {
-      const { data: combined } = await this.octokit.repos.getCombinedStatusForRef({
-        owner: this.ref.owner,
-        repo: this.ref.repo,
-        ref: headSha,
-      });
+      try {
+        const { data: combined } = await this.octokit.repos.getCombinedStatusForRef({
+          owner: this.ref.owner,
+          repo: this.ref.repo,
+          ref: headSha,
+        });
 
-      for (const status of combined.statuses) {
-        const name = status.context || 'status';
-        if (checkNames.has(name.toLowerCase())) continue;
-        const state = status.state;
-        const completed = state !== 'pending';
-        checks.push({
-          id: status.id,
-          name,
-          status: completed ? 'completed' : 'in_progress',
-          conclusion: completed
-            ? state === 'success'
-              ? 'success'
-              : state === 'failure'
-                ? 'failure'
-                : state === 'error'
+        for (const status of combined.statuses) {
+          const name = status.context || 'status';
+          if (checkNames.has(name.toLowerCase())) continue;
+          const state = status.state;
+          const completed = state !== 'pending';
+          checks.push({
+            id: status.id,
+            name,
+            status: completed ? 'completed' : 'in_progress',
+            conclusion: completed
+              ? state === 'success'
+                ? 'success'
+                : state === 'failure'
                   ? 'failure'
-                  : 'neutral'
-            : null,
-          startedAt: status.created_at ?? null,
-          completedAt: completed ? (status.updated_at ?? null) : null,
-          durationSeconds: completed
-            ? secondsBetween(status.created_at, status.updated_at)
-            : null,
-          htmlUrl: status.target_url ?? null,
-          appName: null,
-        });
+                  : state === 'error'
+                    ? 'failure'
+                    : 'neutral'
+              : null,
+            startedAt: status.created_at ?? null,
+            completedAt: completed ? (status.updated_at ?? null) : null,
+            durationSeconds: completed
+              ? secondsBetween(status.created_at, status.updated_at)
+              : null,
+            htmlUrl: status.target_url ?? null,
+            appName: null,
+          });
+        }
+      } catch {
+        // Statuses may be unavailable; check runs alone are still useful.
       }
-    } catch {
-      // Statuses may be unavailable; check runs alone are still useful.
-    }
 
-    checks.sort((a, b) => {
-      const aPending = a.status !== 'completed' ? 0 : 1;
-      const bPending = b.status !== 'completed' ? 0 : 1;
-      if (aPending !== bPending) return aPending - bPending;
-      return a.name.localeCompare(b.name);
+      checks.sort((a, b) => {
+        const aPending = a.status !== 'completed' ? 0 : 1;
+        const bPending = b.status !== 'completed' ? 0 : 1;
+        if (aPending !== bPending) return aPending - bPending;
+        return a.name.localeCompare(b.name);
+      });
+
+      return {
+        headSha,
+        shortSha: headSha.slice(0, 7),
+        state: rollupCheckState(checks),
+        totalCount: checks.length,
+        checks,
+      };
     });
-
-    return {
-      headSha,
-      shortSha: headSha.slice(0, 7),
-      state: rollupCheckState(checks),
-      totalCount: checks.length,
-      checks,
-    };
   }
 
   private async fetchPrTimeline(number: number) {
@@ -352,36 +590,42 @@ export class GitHubService {
     }
   }
 
-  async listCommits(force = false): Promise<CommitSummary[]> {
-    if (this.commitCache && !force) return this.commitCache;
+  async listCommits(days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS): Promise<CommitSummary[]> {
+    return this.cached(this.cacheKey('commits', days), async () => {
+      type CommitItem = Awaited<ReturnType<typeof this.octokit.repos.listCommits>>['data'][number];
+      const raw: CommitItem[] = [];
+      const since = ageLookbackCutoffIso(days);
 
-    const items: Awaited<ReturnType<typeof this.octokit.repos.listCommits>>['data'] = [];
-    for await (const page of this.octokit.paginate.iterator(this.octokit.repos.listCommits, {
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-      per_page: 100,
-    })) {
-      items.push(...page.data);
-      if (items.length >= 200) break;
-    }
+      // Always bound by age via GitHub `since` — never fetch full history.
+      let pages = 0;
+      for await (const page of this.octokit.paginate.iterator(this.octokit.repos.listCommits, {
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        per_page: 100,
+        since,
+      })) {
+        pages += 1;
+        raw.push(...page.data);
+        if (pages >= this.maxPages) break;
+      }
+      this.notePageCap('commits', pages, raw.length);
 
-    this.commitCache = items.slice(0, 200).map((c) => ({
-      sha: c.sha,
-      shortSha: c.sha.slice(0, 7),
-      message: (c.commit.message ?? '').split('\n')[0] ?? '',
-      authorName: c.commit.author?.name ?? null,
-      authorLogin: c.author?.login ?? null,
-      authorDate: c.commit.author?.date ?? null,
-      committerDate: c.commit.committer?.date ?? null,
-      htmlUrl: c.html_url,
-      verified: Boolean(c.commit.verification?.verified),
-    }));
-
-    return this.commitCache;
+      return raw.map((c) => ({
+        sha: c.sha,
+        shortSha: c.sha.slice(0, 7),
+        message: (c.commit.message ?? '').split('\n')[0] ?? '',
+        authorName: c.commit.author?.name ?? null,
+        authorLogin: c.author?.login ?? null,
+        authorDate: c.commit.author?.date ?? null,
+        committerDate: c.commit.committer?.date ?? null,
+        htmlUrl: c.html_url,
+        verified: Boolean(c.commit.verification?.verified),
+      }));
+    });
   }
 
-  async getCommitStats(): Promise<CommitStats> {
-    const commits = await this.listCommits();
+  async getCommitStats(days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS): Promise<CommitStats> {
+    const commits = await this.listCommits(days);
     const authorMap = new Map<string, number>();
     const dayMap = new Map<string, number>();
 
@@ -408,86 +652,176 @@ export class GitHubService {
   }
 
   async getCommit(sha: string): Promise<CommitDetail> {
-    const { data: c } = await this.octokit.repos.getCommit({
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-      ref: sha,
+    return this.cached(this.cacheKey('commit', sha), async () => {
+      const { data: c } = await this.octokit.repos.getCommit({
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        ref: sha,
+      });
+
+      const messageParts = (c.commit.message ?? '').split('\n');
+      const message = messageParts[0] ?? '';
+      const body = messageParts.slice(1).join('\n').trim();
+
+      return {
+        sha: c.sha,
+        shortSha: c.sha.slice(0, 7),
+        message,
+        body,
+        authorName: c.commit.author?.name ?? null,
+        authorLogin: c.author?.login ?? null,
+        authorDate: c.commit.author?.date ?? null,
+        committerDate: c.commit.committer?.date ?? null,
+        htmlUrl: c.html_url,
+        verified: Boolean(c.commit.verification?.verified),
+        parents: c.parents.map((p) => p.sha),
+        stats: {
+          additions: c.stats?.additions ?? 0,
+          deletions: c.stats?.deletions ?? 0,
+          total: c.stats?.total ?? 0,
+        },
+        files: (c.files ?? []).map((f) => ({
+          filename: f.filename ?? '',
+          status: f.status ?? 'modified',
+          additions: f.additions ?? 0,
+          deletions: f.deletions ?? 0,
+          changes: f.changes ?? 0,
+        })),
+      };
     });
+  }
 
-    const messageParts = (c.commit.message ?? '').split('\n');
-    const message = messageParts[0] ?? '';
-    const body = messageParts.slice(1).join('\n').trim();
-
+  private toCreatingRunSummary(run: WorkflowRunSummary): ReleaseCreatingRunSummary {
     return {
-      sha: c.sha,
-      shortSha: c.sha.slice(0, 7),
-      message,
-      body,
-      authorName: c.commit.author?.name ?? null,
-      authorLogin: c.author?.login ?? null,
-      authorDate: c.commit.author?.date ?? null,
-      committerDate: c.commit.committer?.date ?? null,
-      htmlUrl: c.html_url,
-      verified: Boolean(c.commit.verification?.verified),
-      parents: c.parents.map((p) => p.sha),
-      stats: {
-        additions: c.stats?.additions ?? 0,
-        deletions: c.stats?.deletions ?? 0,
-        total: c.stats?.total ?? 0,
-      },
-      files: (c.files ?? []).map((f) => ({
-        filename: f.filename ?? '',
-        status: f.status ?? 'modified',
-        additions: f.additions ?? 0,
-        deletions: f.deletions ?? 0,
-        changes: f.changes ?? 0,
-      })),
+      id: run.id,
+      workflowId: run.workflowId,
+      status: run.status,
+      conclusion: run.conclusion,
+      event: run.event,
+      durationSeconds: run.durationSeconds,
+      htmlUrl: run.htmlUrl,
+      createdAt: run.createdAt,
+      attempt: run.attempt,
     };
   }
 
-  async listReleases(force = false): Promise<ReleaseSummary[]> {
-    if (this.releaseCache && !force) return this.releaseCache;
+  /**
+   * Recent runs for the configured release-creating workflow (`release.yml` by default).
+   * Returns [] when the workflow file is missing so release pages still load.
+   */
+  async listReleaseCreatingWorkflowRuns(): Promise<WorkflowRunSummary[]> {
+    return this.cached(this.cacheKey('release-workflow-runs', this.releaseWorkflowFile), async () => {
+      type RunItem = Awaited<
+        ReturnType<typeof this.octokit.actions.listWorkflowRuns>
+      >['data']['workflow_runs'][number];
+      const raw: RunItem[] = [];
 
-    const items: Awaited<ReturnType<typeof this.octokit.repos.listReleases>>['data'] = [];
-    for await (const page of this.octokit.paginate.iterator(this.octokit.repos.listReleases, {
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-      per_page: 100,
-    })) {
-      items.push(...page.data);
-      if (items.length >= 100) break;
-    }
+      try {
+        let pages = 0;
+        for await (const page of this.octokit.paginate.iterator(this.octokit.actions.listWorkflowRuns, {
+          owner: this.ref.owner,
+          repo: this.ref.repo,
+          workflow_id: this.releaseWorkflowFile,
+          per_page: 100,
+        })) {
+          pages += 1;
+          raw.push(...page.data);
+          if (pages >= this.maxPages) break;
+        }
+        this.notePageCap(`release-workflow:${this.releaseWorkflowFile}`, pages, raw.length);
+      } catch (err) {
+        const status =
+          err && typeof err === 'object' && 'status' in err ? Number((err as { status: unknown }).status) : NaN;
+        if (status === 404) {
+          console.warn(
+            `[github] release workflow "${this.releaseWorkflowFile}" not found in ${this.ref.owner}/${this.ref.repo}`,
+          );
+          return [];
+        }
+        throw err;
+      }
 
-    // API returns newest first; compute cadence vs previous (older) release
-    const chronological = [...items.slice(0, 100)].reverse();
-    const withTiming = chronological.map((rel, idx) => {
-      const associatedPrNumbers = parsePrNumbersFromReleaseNotes(rel.body);
-      const previous = idx > 0 ? chronological[idx - 1] : null;
-      const prevTime = previous?.published_at ?? previous?.created_at;
-      const thisTime = rel.published_at ?? rel.created_at;
-      return {
-        id: rel.id,
-        tagName: rel.tag_name,
-        name: rel.name || rel.tag_name,
-        draft: rel.draft,
-        prerelease: rel.prerelease,
-        author: rel.author?.login ?? null,
-        createdAt: rel.created_at,
-        publishedAt: rel.published_at,
-        htmlUrl: rel.html_url,
-        timeSincePreviousHours: hoursBetween(prevTime, thisTime),
-        associatedPrNumbers,
-        associatedPrCount: associatedPrNumbers.length,
-      };
+      return raw.map((run) => this.mapWorkflowRun(run));
     });
-
-    this.releaseCache = withTiming.reverse();
-    return this.releaseCache;
   }
 
-  async getReleaseStats(): Promise<ReleaseStats> {
-    const releases = await this.listReleases();
+  private async resolveCreatingRun(
+    tagName: string,
+    publishedAt: string | null | undefined,
+    targetCommitish?: string | null,
+  ): Promise<ReleaseCreatingRunSummary | null> {
+    const runs = await this.listReleaseCreatingWorkflowRuns();
+    const match = matchReleaseCreatingRun(tagName, publishedAt, runs, targetCommitish);
+    return match ? this.toCreatingRunSummary(match) : null;
+  }
+
+  async listReleases(days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS): Promise<ReleaseSummary[]> {
+    return this.cached(this.cacheKey('releases', days, this.releaseWorkflowFile), async () => {
+      type ReleaseItem = Awaited<ReturnType<typeof this.octokit.repos.listReleases>>['data'][number];
+      const raw: ReleaseItem[] = [];
+
+      let pages = 0;
+      for await (const page of this.octokit.paginate.iterator(this.octokit.repos.listReleases, {
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        per_page: 100,
+      })) {
+        pages += 1;
+        let reachedCutoff = false;
+        for (const rel of page.data) {
+          if (!isWithinAgeLookback(rel.published_at ?? rel.created_at, days)) {
+            reachedCutoff = true;
+            break;
+          }
+          raw.push(rel);
+        }
+        if (reachedCutoff || pages >= this.maxPages) break;
+      }
+      this.notePageCap('releases', pages, raw.length);
+
+      const creatingRuns = await this.listReleaseCreatingWorkflowRuns();
+
+      // API returns newest first; compute cadence vs previous (older) release
+      const chronological = [...raw].reverse();
+      const withTiming = chronological.map((rel, idx) => {
+        const associatedPrNumbers = parsePrNumbersFromReleaseNotes(rel.body);
+        const previous = idx > 0 ? chronological[idx - 1] : null;
+        const prevTime = previous?.published_at ?? previous?.created_at;
+        const thisTime = rel.published_at ?? rel.created_at;
+        const creatingRun = matchReleaseCreatingRun(
+          rel.tag_name,
+          rel.published_at,
+          creatingRuns,
+          rel.target_commitish,
+        );
+        return {
+          id: rel.id,
+          tagName: rel.tag_name,
+          name: rel.name || rel.tag_name,
+          draft: rel.draft,
+          prerelease: rel.prerelease,
+          author: rel.author?.login ?? null,
+          createdAt: rel.created_at,
+          publishedAt: rel.published_at,
+          htmlUrl: rel.html_url,
+          timeSincePreviousHours: hoursBetween(prevTime, thisTime),
+          associatedPrNumbers,
+          associatedPrCount: associatedPrNumbers.length,
+          creatingRun: creatingRun ? this.toCreatingRunSummary(creatingRun) : null,
+          targetCommitish: rel.target_commitish ?? null,
+        };
+      });
+
+      return withTiming.reverse();
+    });
+  }
+
+  async getReleaseStats(days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS): Promise<ReleaseStats> {
+    const releases = await this.listReleases(days);
     const published = releases.filter((r) => !r.draft && r.publishedAt);
+    const matched = releases.filter((r) => r.creatingRun != null);
+    const creatingSuccess = matched.filter((r) => r.creatingRun?.conclusion === 'success').length;
+    const creatingFailure = matched.filter((r) => r.creatingRun?.conclusion === 'failure').length;
     return {
       total: releases.length,
       drafts: releases.filter((r) => r.draft).length,
@@ -498,63 +832,99 @@ export class GitHubService {
         ? round(releases.reduce((s, r) => s + r.associatedPrCount, 0) / releases.length)
         : 0,
       associatedPrTotal: releases.reduce((s, r) => s + r.associatedPrCount, 0),
+      creatingWorkflowFile: this.releaseWorkflowFile,
+      creatingRunsMatched: matched.length,
+      creatingRunsMissing: releases.length - matched.length,
+      creatingRunSuccess: creatingSuccess,
+      creatingRunFailure: creatingFailure,
+      creatingRunSuccessRate: matched.length ? round((creatingSuccess / matched.length) * 100, 1) : 0,
+      creatingRunDuration: computeTimingStats(
+        matched.map((r) => (r.creatingRun?.durationSeconds != null ? r.creatingRun.durationSeconds / 3600 : null)),
+      ),
     };
   }
 
   async getRelease(id: number): Promise<ReleaseDetail> {
-    const releases = await this.listReleases();
-    const summary = releases.find((r) => r.id === id);
-    if (!summary) {
-      throw Object.assign(new Error(`Release ${id} not found`), { status: 404 });
-    }
+    return this.cached(this.cacheKey('release', id, this.releaseWorkflowFile), async () => {
+      const { data: rel } = await this.octokit.repos.getRelease({
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        release_id: id,
+      });
 
-    const { data: rel } = await this.octokit.repos.getRelease({
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-      release_id: id,
-    });
-
-    const associatedPrNumbers = parsePrNumbersFromReleaseNotes(rel.body);
-    const associatedPrs = await Promise.all(
-      associatedPrNumbers.slice(0, 50).map(async (num) => {
-        try {
-          const { data: pr } = await this.octokit.pulls.get({
-            owner: this.ref.owner,
-            repo: this.ref.repo,
-            pull_number: num,
-          });
-          return {
-            number: pr.number,
-            title: pr.title,
-            htmlUrl: pr.html_url,
-            mergedAt: pr.merged_at,
-            author: pr.user?.login ?? null,
-          };
-        } catch {
-          return {
-            number: num,
-            title: null,
-            htmlUrl: null,
-            mergedAt: null,
-            author: null,
-          };
+      const thisTime = rel.published_at ?? rel.created_at;
+      let timeSincePreviousHours: number | null = null;
+      let seen = false;
+      outer: for await (const page of this.octokit.paginate.iterator(this.octokit.repos.listReleases, {
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        per_page: 100,
+      })) {
+        for (const r of page.data) {
+          if (seen) {
+            timeSincePreviousHours = hoursBetween(r.published_at ?? r.created_at, thisTime);
+            break outer;
+          }
+          if (r.id === id) seen = true;
         }
-      }),
-    );
+      }
 
-    return {
-      ...summary,
-      associatedPrNumbers,
-      associatedPrCount: associatedPrNumbers.length,
-      body: rel.body ?? null,
-      associatedPrs,
-      assets: (rel.assets ?? []).map((a) => ({
-        name: a.name,
-        size: a.size,
-        downloadCount: a.download_count,
-        contentType: a.content_type,
-      })),
-    };
+      const associatedPrNumbers = parsePrNumbersFromReleaseNotes(rel.body);
+      const [associatedPrs, creatingRun] = await Promise.all([
+        Promise.all(
+          associatedPrNumbers.slice(0, 50).map(async (num) => {
+            try {
+              const { data: pr } = await this.octokit.pulls.get({
+                owner: this.ref.owner,
+                repo: this.ref.repo,
+                pull_number: num,
+              });
+              return {
+                number: pr.number,
+                title: pr.title,
+                htmlUrl: pr.html_url,
+                mergedAt: pr.merged_at,
+                author: pr.user?.login ?? null,
+              };
+            } catch {
+              return {
+                number: num,
+                title: null,
+                htmlUrl: null,
+                mergedAt: null,
+                author: null,
+              };
+            }
+          }),
+        ),
+        this.resolveCreatingRun(rel.tag_name, rel.published_at, rel.target_commitish),
+      ]);
+
+      return {
+        id: rel.id,
+        tagName: rel.tag_name,
+        name: rel.name || rel.tag_name,
+        draft: rel.draft,
+        prerelease: rel.prerelease,
+        author: rel.author?.login ?? null,
+        createdAt: rel.created_at,
+        publishedAt: rel.published_at,
+        htmlUrl: rel.html_url,
+        timeSincePreviousHours,
+        associatedPrNumbers,
+        associatedPrCount: associatedPrNumbers.length,
+        creatingRun,
+        targetCommitish: rel.target_commitish ?? null,
+        body: rel.body ?? null,
+        associatedPrs,
+        assets: (rel.assets ?? []).map((a) => ({
+          name: a.name,
+          size: a.size,
+          downloadCount: a.download_count,
+          contentType: a.content_type,
+        })),
+      };
+    });
   }
 
   private mapWorkflowRun(run: {
@@ -566,6 +936,7 @@ export class GitHubService {
     conclusion?: string | null;
     event: string;
     head_branch?: string | null;
+    head_sha?: string | null;
     created_at: string;
     updated_at: string;
     run_started_at?: string | null;
@@ -583,6 +954,7 @@ export class GitHubService {
       conclusion: run.conclusion ?? null,
       event: run.event,
       branch: run.head_branch ?? '',
+      headSha: run.head_sha ?? '',
       createdAt: run.created_at,
       updatedAt: run.updated_at,
       runStartedAt: run.run_started_at ?? null,
@@ -592,53 +964,167 @@ export class GitHubService {
     };
   }
 
-  async listWorkflowRuns(force = false): Promise<WorkflowRunSummary[]> {
-    if (this.workflowCache && !force) return this.workflowCache;
+  /** All workflow definitions in the repo (not derived from recent runs). */
+  async listWorkflows(): Promise<
+    Array<{ id: number; name: string; state: string; path: string; nodeId: string }>
+  > {
+    return this.cached(this.cacheKey('workflow-defs', 'all'), async () => {
+      type WorkflowItem = Awaited<
+        ReturnType<typeof this.octokit.actions.listRepoWorkflows>
+      >['data']['workflows'][number];
+      const raw: WorkflowItem[] = [];
 
-    const { data } = await this.octokit.actions.listWorkflowRunsForRepo({
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-      per_page: 100,
+      let pages = 0;
+      for await (const page of this.octokit.paginate.iterator(this.octokit.actions.listRepoWorkflows, {
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        per_page: 100,
+      })) {
+        pages += 1;
+        raw.push(...page.data);
+        if (pages >= this.maxPages) break;
+      }
+      this.notePageCap('workflow-defs', pages, raw.length);
+
+      return raw
+        .filter((w) => w.state !== 'deleted')
+        .map((w) => ({
+          id: w.id,
+          name: w.name,
+          state: w.state,
+          path: w.path,
+          nodeId: w.node_id,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
     });
-
-    this.workflowCache = data.workflow_runs.map((run) => this.mapWorkflowRun(run));
-    return this.workflowCache;
   }
 
-  /** Past 100 runs for a single workflow definition (not repo-wide). */
-  async listRunsForWorkflow(workflowId: number): Promise<{
+  /**
+   * Up to `perWorkflow` most recent runs for every workflow definition.
+   * Prefer a GraphQL `nodes(ids:)` batch; fall back to one REST list per workflow.
+   */
+  async listRecentRunsPerWorkflow(
+    perWorkflow: number = PER_WORKFLOW_RUN_SAMPLE,
+  ): Promise<{
+    workflows: Array<{ id: number; name: string; state: string; path: string; nodeId: string }>;
+    runsByWorkflowId: Map<number, WorkflowRunSummary[]>;
+  }> {
+    return this.cached(this.cacheKey('workflow-runs-per', `n:${perWorkflow}`), async () => {
+      const workflows = await this.listWorkflows();
+      try {
+        const runsByWorkflowId = await fetchRecentRunsPerWorkflowGraphql(
+          this.octokit,
+          workflows,
+          perWorkflow,
+        );
+        return { workflows, runsByWorkflowId };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`[github] GraphQL per-workflow runs failed; falling back to REST: ${message}`);
+        const runsByWorkflowId = new Map<number, WorkflowRunSummary[]>();
+        // Bound concurrency so a large repo does not stampede the REST API.
+        const concurrency = 6;
+        let cursor = 0;
+        const workers = Array.from({ length: Math.min(concurrency, workflows.length) }, async () => {
+          while (cursor < workflows.length) {
+            const index = cursor;
+            cursor += 1;
+            const wf = workflows[index]!;
+            const { items } = await this.listRunsForWorkflow(wf.id, 50);
+            runsByWorkflowId.set(wf.id, items.slice(0, perWorkflow));
+          }
+        });
+        await Promise.all(workers);
+        return { workflows, runsByWorkflowId };
+      }
+    });
+  }
+
+  async listWorkflowRuns(limit: RunLimit = DEFAULT_RUN_LIMIT): Promise<WorkflowRunSummary[]> {
+    return this.cached(this.cacheKey('workflows', `limit:${limit}`), async () => {
+      type RunItem = Awaited<
+        ReturnType<typeof this.octokit.actions.listWorkflowRunsForRepo>
+      >['data']['workflow_runs'][number];
+      const raw: RunItem[] = [];
+
+      let pages = 0;
+      for await (const page of this.octokit.paginate.iterator(
+        this.octokit.actions.listWorkflowRunsForRepo,
+        {
+          owner: this.ref.owner,
+          repo: this.ref.repo,
+          per_page: 100,
+        },
+      )) {
+        pages += 1;
+        for (const run of page.data) {
+          raw.push(run);
+          if (raw.length >= limit) break;
+        }
+        if (raw.length >= limit || pages >= this.maxPages) break;
+      }
+      this.notePageCap('workflows', pages, raw.length);
+
+      return raw.slice(0, limit).map((run) => this.mapWorkflowRun(run));
+    });
+  }
+
+  /** Runs for a single workflow definition, bounded by recent-run count. */
+  async listRunsForWorkflow(
+    workflowId: number,
+    limit: RunLimit = DEFAULT_RUN_LIMIT,
+  ): Promise<{
     workflowId: number;
     name: string;
     items: WorkflowRunSummary[];
   }> {
-    const { data } = await this.octokit.actions.listWorkflowRuns({
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-      workflow_id: workflowId,
-      per_page: 100,
-    });
+    return this.cached(this.cacheKey('workflow-runs', `limit:${limit}`, String(workflowId)), async () => {
+      type RunItem = Awaited<
+        ReturnType<typeof this.octokit.actions.listWorkflowRuns>
+      >['data']['workflow_runs'][number];
+      const raw: RunItem[] = [];
 
-    const items = data.workflow_runs.map((run) => this.mapWorkflowRun(run));
-    let name = items[0]?.workflowName;
-
-    if (!name) {
-      try {
-        const { data: workflow } = await this.octokit.actions.getWorkflow({
-          owner: this.ref.owner,
-          repo: this.ref.repo,
-          workflow_id: workflowId,
-        });
-        name = workflow.name;
-      } catch {
-        name = `Workflow ${workflowId}`;
+      let pages = 0;
+      for await (const page of this.octokit.paginate.iterator(this.octokit.actions.listWorkflowRuns, {
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        workflow_id: workflowId,
+        per_page: 100,
+      })) {
+        pages += 1;
+        for (const run of page.data) {
+          raw.push(run);
+          if (raw.length >= limit) break;
+        }
+        if (raw.length >= limit || pages >= this.maxPages) break;
       }
-    }
+      this.notePageCap(`workflow:${workflowId}`, pages, raw.length);
 
-    return { workflowId, name, items };
+      const items = raw.slice(0, limit).map((run) => this.mapWorkflowRun(run));
+      let name = items[0]?.workflowName;
+
+      if (!name) {
+        try {
+          const { data: workflow } = await this.octokit.actions.getWorkflow({
+            owner: this.ref.owner,
+            repo: this.ref.repo,
+            workflow_id: workflowId,
+          });
+          name = workflow.name;
+        } catch {
+          name = `Workflow ${workflowId}`;
+        }
+      }
+
+      return { workflowId, name, items };
+    });
   }
 
-  async getWorkflowStats(): Promise<WorkflowStats> {
-    const runs = await this.listWorkflowRuns();
+  async getWorkflowStats(_limit: RunLimit = DEFAULT_RUN_LIMIT): Promise<WorkflowStats> {
+    // Fair sample: last N runs per workflow via GraphQL batch (not a single repo-wide list).
+    const { workflows, runsByWorkflowId } = await this.listRecentRunsPerWorkflow(PER_WORKFLOW_RUN_SAMPLE);
+    const runs = [...runsByWorkflowId.values()].flat();
+
     const success = runs.filter((r) => r.conclusion === 'success').length;
     const failure = runs.filter((r) => r.conclusion === 'failure').length;
     const cancelled = runs.filter((r) => r.conclusion === 'cancelled').length;
@@ -646,8 +1132,26 @@ export class GitHubService {
 
     const byWorkflowMap = new Map<
       number,
-      { name: string; total: number; success: number; failure: number; durations: number[] }
+      {
+        name: string;
+        total: number;
+        success: number;
+        failure: number;
+        durations: number[];
+        runsNewestFirst: WorkflowRunSummary[];
+      }
     >();
+
+    for (const workflow of workflows) {
+      byWorkflowMap.set(workflow.id, {
+        name: workflow.name,
+        total: 0,
+        success: 0,
+        failure: 0,
+        durations: [],
+        runsNewestFirst: [],
+      });
+    }
 
     const dayMap = new Map<string, { success: number; failure: number; other: number }>();
 
@@ -658,12 +1162,16 @@ export class GitHubService {
         success: 0,
         failure: 0,
         durations: [],
+        runsNewestFirst: [],
       };
-      entry.name = run.workflowName;
+      if (!byWorkflowMap.has(run.workflowId)) {
+        entry.name = run.workflowName;
+      }
       entry.total += 1;
       if (run.conclusion === 'success') entry.success += 1;
       if (run.conclusion === 'failure') entry.failure += 1;
       if (run.durationSeconds != null) entry.durations.push(run.durationSeconds);
+      entry.runsNewestFirst.push(run);
       byWorkflowMap.set(run.workflowId, entry);
 
       const day = (run.runStartedAt ?? run.createdAt).slice(0, 10);
@@ -685,63 +1193,205 @@ export class GitHubService {
       successRate: runs.length ? round((success / runs.length) * 100, 1) : 0,
       duration: computeTimingStats(durationHours),
       byWorkflow: [...byWorkflowMap.entries()]
-        .map(([workflowId, v]) => ({
-          workflowId,
-          name: v.name,
-          total: v.total,
-          success: v.success,
-          failure: v.failure,
-          avgDurationSeconds:
-            v.durations.length > 0
-              ? round(v.durations.reduce((a, b) => a + b, 0) / v.durations.length)
-              : null,
-          maxDurationSeconds: v.durations.length > 0 ? Math.max(...v.durations) : null,
-        }))
-        .sort((a, b) => b.total - a.total),
+        .map(([workflowId, v]) => {
+          const sorted = [...v.runsNewestFirst].sort((a, b) =>
+            (b.runStartedAt ?? b.createdAt).localeCompare(a.runStartedAt ?? a.createdAt),
+          );
+          const recentConclusions = sorted
+            .slice(0, CI_RECENT_CONCLUSION_COUNT)
+            .map((r) => conclusionKind(r.conclusion));
+          const sparkSource = [...sorted].reverse();
+          const durationSparkline = sparkSource
+            .map((r) => r.durationSeconds)
+            .filter((d): d is number => d != null && Number.isFinite(d))
+            .slice(-CI_RECENT_CONCLUSION_COUNT);
+          const successRate = v.total ? round((v.success / v.total) * 100, 1) : 0;
+          const failureRate = v.total ? round((v.failure / v.total) * 100, 1) : 0;
+          return {
+            workflowId,
+            name: v.name,
+            total: v.total,
+            success: v.success,
+            failure: v.failure,
+            successRate,
+            failureRate,
+            consecutiveFailures: countConsecutiveFailures(sorted),
+            recentConclusions,
+            durationSparkline,
+            avgDurationSeconds:
+              v.durations.length > 0
+                ? round(v.durations.reduce((a, b) => a + b, 0) / v.durations.length)
+                : null,
+            maxDurationSeconds: v.durations.length > 0 ? Math.max(...v.durations) : null,
+          };
+        })
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
       recentConclusions: [...dayMap.entries()]
         .map(([date, v]) => ({ date, ...v }))
         .sort((a, b) => a.date.localeCompare(b.date)),
     };
   }
 
-  async getWorkflowRun(id: number): Promise<WorkflowRunDetail> {
-    const runs = await this.listWorkflowRuns();
-    let base: WorkflowRunSummary | undefined = runs.find((r) => r.id === id);
+  /**
+   * Aggregate release-train / orchestration stage health from recent creating-workflow runs.
+   * Reuses release-workflow-runs + per-run caches; soft-fails when artifacts are missing.
+   */
+  async getOrchestrationHealth(): Promise<OrchestrationHealthSummary> {
+    return this.cached(this.cacheKey('orchestration-health', this.releaseWorkflowFile), async () => {
+      const runs = await this.listReleaseCreatingWorkflowRuns();
+      const candidates = runs
+        .filter((r) => r.status === 'completed' || r.conclusion != null)
+        .slice(0, ORCHESTRATION_HEALTH_SAMPLE);
 
-    if (!base) {
+      const details = await mapPool(candidates, ORCHESTRATION_HEALTH_CONCURRENCY, async (run) => {
+        try {
+          return await this.getWorkflowRun(run.id, { includeOrchestration: true });
+        } catch {
+          return null;
+        }
+      });
+
+      const stageAgg = new Map<
+        string,
+        { stageId: string; name: string; group: string; success: number; failure: number; samples: number }
+      >();
+      const suiteFailures = new Map<string, number>();
+      const recentRuns: OrchestrationHealthSummary['recentRuns'] = [];
+      let runsWithState = 0;
+
+      for (const detail of details) {
+        if (!detail?.orchestration) continue;
+        runsWithState += 1;
+        const stages = detail.orchestration.pipeline.stages;
+        const failedStages: string[] = [];
+
+        for (const stage of stages) {
+          const id = stage.Stage.ID || stage.Stage.Name;
+          const entry = stageAgg.get(id) ?? {
+            stageId: id,
+            name: stage.Stage.Name || id,
+            group: stage.Stage.Group ?? '',
+            success: 0,
+            failure: 0,
+            samples: 0,
+          };
+          if (stage.State === ORCH_STAGE_SUCCESS || stage.State === ORCH_STAGE_FAILURE) {
+            entry.samples += 1;
+            if (stage.State === ORCH_STAGE_SUCCESS) entry.success += 1;
+            if (stage.State === ORCH_STAGE_FAILURE) {
+              entry.failure += 1;
+              failedStages.push(stage.Stage.Name || id);
+            }
+          }
+          stageAgg.set(id, entry);
+
+          const suites = stage.TestReport?.suites ?? [];
+          for (const suite of suites) {
+            if (suite.failed > 0) {
+              suiteFailures.set(suite.label || suite.key, (suiteFailures.get(suite.label || suite.key) ?? 0) + suite.failed);
+            }
+          }
+        }
+
+        recentRuns.push({
+          runId: detail.id,
+          createdAt: detail.createdAt,
+          htmlUrl: detail.htmlUrl,
+          failedStages,
+        });
+      }
+
+      const stageStats = [...stageAgg.values()]
+        .filter((s) => s.samples > 0)
+        .map((s) => ({
+          stageId: s.stageId,
+          name: s.name,
+          group: s.group,
+          successRate: s.samples ? round((s.success / s.samples) * 100, 1) : 0,
+          failureRate: s.samples ? round((s.failure / s.samples) * 100, 1) : 0,
+          samples: s.samples,
+        }))
+        .sort((a, b) => b.failureRate - a.failureRate || a.name.localeCompare(b.name));
+
+      const topFailingSuites = [...suiteFailures.entries()]
+        .map(([name, failures]) => ({ name, failures }))
+        .sort((a, b) => b.failures - a.failures)
+        .slice(0, 8);
+
+      return {
+        sampleSize: candidates.length,
+        runsWithState,
+        stageStats,
+        topFailingSuites,
+        recentRuns,
+      };
+    });
+  }
+
+  async getWorkflowRun(
+    id: number,
+    options?: { includeOrchestration?: boolean; owner?: string; repo?: string },
+  ): Promise<WorkflowRunDetail> {
+    const includeOrchestration = options?.includeOrchestration !== false;
+    const owner = options?.owner?.trim() || this.ref.owner;
+    const repo = options?.repo?.trim() || this.ref.repo;
+    const orchKey = includeOrchestration ? 'orch' : 'no-orch';
+
+    return this.cached(this.cacheKey('workflow-run', id, `${owner}/${repo}:${orchKey}`), async () => {
+      const isPrimaryRepo = owner === this.ref.owner && repo === this.ref.repo;
+
       const { data: run } = await this.octokit.actions.getWorkflowRun({
-        owner: this.ref.owner,
-        repo: this.ref.repo,
+        owner,
+        repo,
         run_id: id,
       });
-      base = this.mapWorkflowRun(run);
-    }
+      const base = this.mapWorkflowRun(run);
 
-    const { data: jobsData } = await this.octokit.actions.listJobsForWorkflowRun({
-      owner: this.ref.owner,
-      repo: this.ref.repo,
-      run_id: id,
-      per_page: 100,
+      const jobsPromise = this.octokit.actions.listJobsForWorkflowRun({
+        owner,
+        repo,
+        run_id: id,
+        per_page: 100,
+      });
+
+      const orchestrationPromise =
+        includeOrchestration && isPrimaryRepo
+          ? loadOrchestrationFromArtifacts(this.octokit, owner, repo, id)
+          : Promise.resolve({ orchestration: null, orchestrationArtifact: null });
+
+      const [{ data: jobsData }, orchestrationResult] = await Promise.all([
+        jobsPromise,
+        orchestrationPromise,
+      ]);
+
+      return {
+        ...base,
+        jobs: jobsData.jobs.map((job) => {
+          const htmlUrl = job.html_url ?? '';
+          return {
+            id: job.id,
+            name: job.name,
+            status: job.status,
+            conclusion: job.conclusion ?? null,
+            createdAt: job.created_at ?? null,
+            startedAt: job.started_at ?? null,
+            completedAt: job.completed_at ?? null,
+            durationSeconds: secondsBetween(job.started_at, job.completed_at),
+            queueSeconds: secondsBetween(job.created_at, job.started_at),
+            htmlUrl,
+            steps: (job.steps ?? []).map((step) => ({
+              name: step.name,
+              status: step.status,
+              conclusion: step.conclusion ?? null,
+              number: step.number,
+              durationSeconds: secondsBetween(step.started_at, step.completed_at),
+              htmlUrl: htmlUrl ? `${htmlUrl}#step:${step.number}:1` : '',
+            })),
+          };
+        }),
+        orchestration: orchestrationResult.orchestration,
+        orchestrationArtifact: orchestrationResult.orchestrationArtifact,
+      };
     });
-
-    return {
-      ...base,
-      jobs: jobsData.jobs.map((job) => ({
-        id: job.id,
-        name: job.name,
-        status: job.status,
-        conclusion: job.conclusion ?? null,
-        startedAt: job.started_at ?? null,
-        completedAt: job.completed_at ?? null,
-        durationSeconds: secondsBetween(job.started_at, job.completed_at),
-        steps: (job.steps ?? []).map((step) => ({
-          name: step.name,
-          status: step.status,
-          conclusion: step.conclusion ?? null,
-          number: step.number,
-          durationSeconds: secondsBetween(step.started_at, step.completed_at),
-        })),
-      })),
-    };
   }
 }

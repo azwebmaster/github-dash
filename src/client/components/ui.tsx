@@ -1,5 +1,11 @@
-import { Box, Paper, Skeleton, Stack, Typography } from '@mui/material';
+import { Box, MenuItem, Paper, Skeleton, Stack, TextField, Typography } from '@mui/material';
 import type { ReactNode } from 'react';
+import {
+  AGE_LOOKBACK_OPTIONS,
+  RUN_LIMIT_OPTIONS,
+  type AgeLookbackDays,
+  type RunLimit,
+} from '../../shared/utils';
 
 export function StatTile({
   label,
@@ -8,7 +14,7 @@ export function StatTile({
 }: {
   label: string;
   value: ReactNode;
-  hint?: string;
+  hint?: ReactNode;
 }) {
   return (
     <Paper sx={{ p: 2, height: '100%' }}>
@@ -92,4 +98,58 @@ export function formatDate(value: string | null | undefined): string {
   } catch {
     return value;
   }
+}
+
+export function AgeFilter({
+  value,
+  onChange,
+  sx,
+}: {
+  value: AgeLookbackDays;
+  onChange: (days: AgeLookbackDays) => void;
+  sx?: object;
+}) {
+  return (
+    <TextField
+      select
+      size="small"
+      label="Age"
+      value={String(value)}
+      onChange={(e) => onChange(Number(e.target.value) as AgeLookbackDays)}
+      sx={{ minWidth: { md: 160 }, ...sx }}
+    >
+      {AGE_LOOKBACK_OPTIONS.map((opt) => (
+        <MenuItem key={opt.value} value={String(opt.value)}>
+          {opt.label}
+        </MenuItem>
+      ))}
+    </TextField>
+  );
+}
+
+export function RunLimitFilter({
+  value,
+  onChange,
+  sx,
+}: {
+  value: RunLimit;
+  onChange: (limit: RunLimit) => void;
+  sx?: object;
+}) {
+  return (
+    <TextField
+      select
+      size="small"
+      label="Runs"
+      value={String(value)}
+      onChange={(e) => onChange(Number(e.target.value) as RunLimit)}
+      sx={{ minWidth: { md: 160 }, ...sx }}
+    >
+      {RUN_LIMIT_OPTIONS.map((opt) => (
+        <MenuItem key={opt.value} value={String(opt.value)}>
+          {opt.label}
+        </MenuItem>
+      ))}
+    </TextField>
+  );
 }

@@ -2,6 +2,7 @@ import type {
   CommitDetail,
   CommitStats,
   CommitSummary,
+  OrchestrationHealthSummary,
   OverviewStats,
   PrChecks,
   PrDetail,
@@ -14,36 +15,96 @@ import type {
   WorkflowRunSummary,
   WorkflowStats,
 } from '../../shared/types';
+import { DEFAULT_AGE_LOOKBACK_DAYS, DEFAULT_RUN_LIMIT, type AgeLookbackDays, type RunLimit } from '../../shared/utils';
+
+/** Browser-side TTL so route remounts don't wait on the network for warm data. */
+const CLIENT_CACHE_TTL_MS = 60_000;
+
+interface CacheEntry {
+  expiresAt: number;
+  value: unknown;
+}
+
+const clientCache = new Map<string, CacheEntry>();
+const clientInflight = new Map<string, Promise<unknown>>();
 
 async function request<T>(path: string): Promise<T> {
-  const res = await fetch(path);
-  if (!res.ok) {
-    let message = res.statusText;
-    try {
-      const body = (await res.json()) as { error?: string };
-      if (body.error) message = body.error;
-    } catch {
-      // ignore
-    }
-    throw new Error(message || `Request failed (${res.status})`);
+  const now = Date.now();
+  const cached = clientCache.get(path);
+  if (cached && cached.expiresAt > now) {
+    return cached.value as T;
   }
-  return res.json() as Promise<T>;
+
+  const pending = clientInflight.get(path);
+  if (pending) return pending as Promise<T>;
+
+  const promise = (async () => {
+    const res = await fetch(path);
+    if (!res.ok) {
+      let message = res.statusText;
+      try {
+        const body = (await res.json()) as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        // ignore
+      }
+      throw new Error(message || `Request failed (${res.status})`);
+    }
+    const value = (await res.json()) as T;
+    clientCache.set(path, { value, expiresAt: Date.now() + CLIENT_CACHE_TTL_MS });
+    return value;
+  })().finally(() => {
+    clientInflight.delete(path);
+  });
+
+  clientInflight.set(path, promise);
+  return promise;
+}
+
+function daysQuery(days: AgeLookbackDays): string {
+  const params = new URLSearchParams();
+  params.set('days', String(days));
+  return params.toString();
+}
+
+function limitQuery(limit: RunLimit): string {
+  const params = new URLSearchParams();
+  params.set('limit', String(limit));
+  return params.toString();
 }
 
 export const api = {
-  meta: () => request<{ owner: string; repo: string }>('/api/meta'),
-  overview: () => request<OverviewStats>('/api/overview'),
-  prs: () => request<{ items: PrSummary[]; stats: PrStats }>('/api/prs'),
+  meta: () => request<{ owner: string; repo: string; releaseWorkflowFile: string }>('/api/meta'),
+  overview: (days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS) =>
+    request<OverviewStats>(`/api/overview?${daysQuery(days)}`),
+  prs: (days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS) =>
+    request<{ items: PrSummary[]; stats: PrStats }>(`/api/prs?${daysQuery(days)}`),
   pr: (n: number) => request<PrDetail>(`/api/prs/${n}`),
   prChecks: (n: number) => request<PrChecks>(`/api/prs/${n}/checks`),
-  commits: () => request<{ items: CommitSummary[]; stats: CommitStats }>('/api/commits'),
+  commits: (days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS) =>
+    request<{ items: CommitSummary[]; stats: CommitStats }>(`/api/commits?${daysQuery(days)}`),
   commit: (sha: string) => request<CommitDetail>(`/api/commits/${sha}`),
-  releases: () => request<{ items: ReleaseSummary[]; stats: ReleaseStats }>('/api/releases'),
+  releases: (days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS) =>
+    request<{ items: ReleaseSummary[]; stats: ReleaseStats }>(`/api/releases?${daysQuery(days)}`),
   release: (id: number) => request<ReleaseDetail>(`/api/releases/${id}`),
-  workflows: () => request<{ items: WorkflowRunSummary[]; stats: WorkflowStats }>('/api/workflows'),
-  workflowRuns: (workflowId: number) =>
-    request<{ workflowId: number; name: string; items: WorkflowRunSummary[] }>(
-      `/api/workflows/by/${workflowId}`,
+  workflows: (limit: RunLimit = DEFAULT_RUN_LIMIT) =>
+    request<{ items: WorkflowRunSummary[]; stats: WorkflowStats }>(
+      `/api/workflows?${limitQuery(limit)}`,
     ),
-  workflow: (id: number) => request<WorkflowRunDetail>(`/api/workflows/${id}`),
+  workflowRuns: (workflowId: number, limit: RunLimit = DEFAULT_RUN_LIMIT) =>
+    request<{ workflowId: number; name: string; items: WorkflowRunSummary[] }>(
+      `/api/workflows/by/${workflowId}?${limitQuery(limit)}`,
+    ),
+  workflow: (
+    id: number,
+    opts?: { includeOrchestration?: boolean; owner?: string; repo?: string },
+  ) => {
+    const params = new URLSearchParams();
+    if (opts?.includeOrchestration === false) params.set('orchestration', '0');
+    if (opts?.owner) params.set('owner', opts.owner);
+    if (opts?.repo) params.set('repo', opts.repo);
+    const qs = params.toString();
+    return request<WorkflowRunDetail>(`/api/workflows/${id}${qs ? `?${qs}` : ''}`);
+  },
+  orchestrationHealth: () => request<OrchestrationHealthSummary>('/api/orchestration/health'),
 };

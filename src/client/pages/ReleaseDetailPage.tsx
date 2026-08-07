@@ -20,15 +20,26 @@ import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
 import { MarkdownContent } from '../components/MarkdownContent';
 import { ErrorState, LoadingBlock, PageHeader, StatTile, formatDate } from '../components/ui';
-import { formatDurationHours } from '../../shared/utils';
+import { formatDurationHours, formatDurationSeconds } from '../../shared/utils';
+
+function conclusionColor(conclusion: string | null | undefined): 'success' | 'error' | 'warning' | 'default' {
+  if (conclusion === 'success') return 'success';
+  if (conclusion === 'failure') return 'error';
+  if (conclusion === 'cancelled') return 'warning';
+  return 'default';
+}
 
 export default function ReleaseDetailPage() {
   const { id } = useParams();
   const releaseId = Number(id);
   const { data, error, loading } = useAsyncData(() => api.release(releaseId), [releaseId]);
+  const { data: meta } = useAsyncData(() => api.meta(), []);
 
   if (loading) return <LoadingBlock />;
   if (error || !data) return <ErrorState message={error ?? 'Release not found'} />;
+
+  const creatingRun = data.creatingRun;
+  const workflowFile = meta?.releaseWorkflowFile ?? 'release.yml';
 
   return (
     <Stack spacing={3}>
@@ -66,6 +77,62 @@ export default function ReleaseDetailPage() {
           <StatTile label="Assets" value={data.assets.length} />
         </Grid>
       </Grid>
+
+      <Paper sx={{ p: 2.5 }}>
+        <Typography variant="h6" gutterBottom>
+          Creating workflow run
+        </Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          Matched from <code>{workflowFile}</code> by release commit SHA or tag
+        </Typography>
+        {creatingRun ? (
+          <Grid container spacing={2}>
+            <Grid size={{ xs: 6, md: 3 }}>
+              <StatTile
+                label="Run"
+                value={
+                  <Link component={RouterLink} to={`/workflows/${creatingRun.id}`} underline="hover">
+                    #{creatingRun.id}
+                  </Link>
+                }
+                hint={creatingRun.event}
+              />
+            </Grid>
+            <Grid size={{ xs: 6, md: 3 }}>
+              <StatTile
+                label="Result"
+                value={
+                  <Chip
+                    size="small"
+                    label={creatingRun.conclusion ?? creatingRun.status ?? '—'}
+                    color={conclusionColor(creatingRun.conclusion)}
+                    variant="outlined"
+                  />
+                }
+                hint={`attempt ${creatingRun.attempt}`}
+              />
+            </Grid>
+            <Grid size={{ xs: 6, md: 3 }}>
+              <StatTile label="Duration" value={formatDurationSeconds(creatingRun.durationSeconds)} />
+            </Grid>
+            <Grid size={{ xs: 6, md: 3 }}>
+              <StatTile
+                label="Started"
+                value={formatDate(creatingRun.createdAt)}
+                hint={
+                  <Link href={creatingRun.htmlUrl} target="_blank" rel="noreferrer" underline="hover">
+                    Open on GitHub ↗
+                  </Link>
+                }
+              />
+            </Grid>
+          </Grid>
+        ) : (
+          <Typography color="text.secondary">
+            No matching run found for tag <code>{data.tagName}</code> in <code>{workflowFile}</code>.
+          </Typography>
+        )}
+      </Paper>
 
       <Grid container spacing={2}>
         <Grid size={{ xs: 12, md: 6 }}>
