@@ -178,6 +178,14 @@ export function createApp(options: CreateAppOptions): Express {
     }
   });
 
+  app.get('/api/workflows/map', async (_req, res, next) => {
+    try {
+      res.json(await github.getWorkflowLifecycleMap());
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.get('/api/workflows/by/:workflowId', async (req, res, next) => {
     try {
       const workflowId = Number(req.params.workflowId);

@@ -403,6 +403,48 @@ export interface WorkflowStats {
   recentConclusions: Array<{ date: string; success: number; failure: number; other: number }>;
 }
 
+/** Lifecycle stage for grouping workflows by when they run. */
+export type WorkflowLifecycleLaneId =
+  | 'pull_request'
+  | 'merge_queue'
+  | 'push'
+  | 'release'
+  | 'schedule'
+  | 'manual'
+  | 'reusable'
+  | 'other';
+
+export interface WorkflowMapEntry {
+  workflowId: number;
+  name: string;
+  path: string;
+  state: string;
+  /** Raw GitHub Actions event names from the workflow `on:` block. */
+  triggers: string[];
+  lanes: WorkflowLifecycleLaneId[];
+  /** True when any trigger declares `paths` / `paths-ignore`. */
+  pathFiltered: boolean;
+  /** How triggers were determined. */
+  source: 'yaml' | 'observed' | 'unknown';
+}
+
+export interface WorkflowLifecycleLane {
+  id: WorkflowLifecycleLaneId;
+  label: string;
+  description: string;
+  /** Part of the main PR → queue → push → release path. */
+  primary: boolean;
+  workflows: WorkflowMapEntry[];
+}
+
+export interface WorkflowLifecycleMap {
+  lanes: WorkflowLifecycleLane[];
+  workflows: WorkflowMapEntry[];
+  parsedFromYaml: number;
+  observedOnly: number;
+  unknown: number;
+}
+
 export interface OverviewStats {
   repo: {
     fullName: string;

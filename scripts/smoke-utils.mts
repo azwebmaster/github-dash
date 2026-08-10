@@ -151,4 +151,49 @@ assert.equal(await cache.get('k'), undefined);
   assert.equal(resolveCacheTtlMs({ CACHE_TTL_MS: '120000' }), 120_000);
 }
 
+{
+  const {
+    extractWorkflowTriggers,
+    lanesForTriggers,
+  } = await import('../src/server/github/workflow-triggers.ts');
+
+  assert.deepEqual(
+    extractWorkflowTriggers(`
+name: Merge Queue
+on:
+  pull_request:
+  merge_group:
+    branches: [main]
+jobs: {}
+`),
+    { events: ['pull_request', 'merge_group'], hasPathFilters: false },
+  );
+
+  assert.deepEqual(
+    extractWorkflowTriggers(`
+on:
+  pull_request:
+    paths:
+      - 'app/**'
+  push:
+    branches: [main]
+`),
+    { events: ['pull_request', 'push'], hasPathFilters: true },
+  );
+
+  assert.deepEqual(extractWorkflowTriggers('on: [push, pull_request]\n'), {
+    events: ['push', 'pull_request'],
+    hasPathFilters: false,
+  });
+
+  assert.deepEqual(lanesForTriggers(['merge_group', 'pull_request'], 'Merge Queue'), [
+    'pull_request',
+    'merge_queue',
+  ]);
+  assert.deepEqual(lanesForTriggers(['workflow_dispatch'], 'Promote Artifact'), [
+    'release',
+    'manual',
+  ]);
+}
+
 console.log('ok');

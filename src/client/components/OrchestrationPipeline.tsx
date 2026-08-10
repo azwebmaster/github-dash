@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   Accordion,
   AccordionDetails,
@@ -460,12 +460,58 @@ function fitZoomLevel(available: number, natural: number): number {
   return clampFlowZoom(Math.floor(next * 100) / 100, 0.01);
 }
 
+function readNaturalSize(el: HTMLElement): { width: number; height: number } {
+  // scroll* reflects max-content even if a parent would otherwise shrink the box.
+  return {
+    width: Math.max(el.offsetWidth, el.scrollWidth),
+    height: Math.max(el.offsetHeight, el.scrollHeight),
+  };
+}
+
 function StageFlowDiagram({ stages }: { stages: OrchestrationStageRun[] }) {
   const [zoom, setZoom] = useState(FLOW_ZOOM_DEFAULT);
   const [contentSize, setContentSize] = useState({ width: 0, height: 0 });
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
+  /** When true, viewport resize / stage changes re-run fit. Cleared by manual zoom. */
+  const autoFitRef = useRef(true);
   const groups = groupStagesForFlow(stages);
+
+  const applyZoom = (next: number | ((prev: number) => number), opts?: { autoFit?: boolean }) => {
+    if (opts?.autoFit === false) autoFitRef.current = false;
+    if (opts?.autoFit === true) autoFitRef.current = true;
+    setZoom(next);
+  };
+
+  const fitToWindow = (opts?: { userInitiated?: boolean }) => {
+    const viewport = viewportRef.current;
+    const content = contentRef.current;
+    if (!viewport || !content) return;
+
+    const { width: naturalWidth } = readNaturalSize(content);
+    if (naturalWidth <= 0) return;
+
+    const styles = getComputedStyle(viewport);
+    const padX = (parseFloat(styles.paddingLeft) || 0) + (parseFloat(styles.paddingRight) || 0);
+    const availableWidth = Math.max(0, viewport.clientWidth - padX);
+    const next = fitZoomLevel(availableWidth, naturalWidth);
+    if (opts?.userInitiated) autoFitRef.current = true;
+    setZoom(next);
+    viewport.scrollLeft = 0;
+    viewport.scrollTop = 0;
+
+    // Second pass after paint: correct if a scrollbar (or subpixels) still overflows.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const vp = viewportRef.current;
+        if (!vp) return;
+        if (vp.scrollWidth <= vp.clientWidth + 1) return;
+        const ratio = vp.clientWidth / vp.scrollWidth;
+        setZoom((z) => clampFlowZoom(Math.floor(z * ratio * 100) / 100, 0.01));
+        vp.scrollLeft = 0;
+      });
+    });
+  };
 
   useEffect(() => {
     const el = viewportRef.current;
@@ -474,51 +520,44 @@ function StageFlowDiagram({ stages }: { stages: OrchestrationStageRun[] }) {
       if (!(event.ctrlKey || event.metaKey)) return;
       event.preventDefault();
       const delta = event.deltaY > 0 ? -FLOW_ZOOM_STEP : FLOW_ZOOM_STEP;
+      autoFitRef.current = false;
       setZoom((z) => clampFlowZoom(z + delta));
     };
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
   }, []);
 
-  useEffect(() => {
-    const el = contentRef.current;
-    if (!el) return;
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    const viewport = viewportRef.current;
+    if (!content) return;
+
+    autoFitRef.current = true;
     const measure = () => {
-      // offsetWidth/Height ignore transform — that is the natural layout size.
-      setContentSize({ width: el.offsetWidth, height: el.offsetHeight });
+      const size = readNaturalSize(content);
+      setContentSize((prev) =>
+        prev.width === size.width && prev.height === size.height ? prev : size,
+      );
+      if (autoFitRef.current) fitToWindow();
     };
     measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
+
+    const contentRo = new ResizeObserver(measure);
+    contentRo.observe(content);
+
+    const viewportRo = viewport
+      ? new ResizeObserver(() => {
+          if (autoFitRef.current) fitToWindow();
+        })
+      : null;
+    if (viewport && viewportRo) viewportRo.observe(viewport);
+
+    return () => {
+      contentRo.disconnect();
+      viewportRo?.disconnect();
+    };
+    // stages identity changes when the env filter updates the diagram.
   }, [stages]);
-
-  const fitToWindow = () => {
-    const viewport = viewportRef.current;
-    const content = contentRef.current;
-    if (!viewport || !content) return;
-
-    const naturalWidth = content.offsetWidth;
-    if (naturalWidth <= 0) return;
-
-    const styles = getComputedStyle(viewport);
-    const padX = (parseFloat(styles.paddingLeft) || 0) + (parseFloat(styles.paddingRight) || 0);
-    const availableWidth = Math.max(0, viewport.clientWidth - padX);
-    const next = fitZoomLevel(availableWidth, naturalWidth);
-    setZoom(next);
-    viewport.scrollLeft = 0;
-    viewport.scrollTop = 0;
-
-    // Second pass after layout: correct if a scrollbar (or subpixels) still overflows.
-    requestAnimationFrame(() => {
-      const vp = viewportRef.current;
-      if (!vp) return;
-      if (vp.scrollWidth <= vp.clientWidth + 1) return;
-      const ratio = vp.clientWidth / vp.scrollWidth;
-      setZoom((z) => clampFlowZoom(Math.floor(z * ratio * 100) / 100, 0.01));
-      vp.scrollLeft = 0;
-    });
-  };
 
   if (groups.length === 0) return null;
 
@@ -548,7 +587,7 @@ function StageFlowDiagram({ stages }: { stages: OrchestrationStageRun[] }) {
               <IconButton
                 size="small"
                 aria-label="Zoom out stage flow"
-                onClick={() => setZoom((z) => clampFlowZoom(z - FLOW_ZOOM_STEP))}
+                onClick={() => applyZoom((z) => clampFlowZoom(z - FLOW_ZOOM_STEP), { autoFit: false })}
                 disabled={zoom <= FLOW_ZOOM_MIN}
               >
                 <ZoomOutIcon fontSize="small" />
@@ -561,7 +600,7 @@ function StageFlowDiagram({ stages }: { stages: OrchestrationStageRun[] }) {
                 size="small"
                 variant="text"
                 color="inherit"
-                onClick={() => setZoom(FLOW_ZOOM_DEFAULT)}
+                onClick={() => applyZoom(FLOW_ZOOM_DEFAULT, { autoFit: false })}
                 disabled={zoom === FLOW_ZOOM_DEFAULT}
                 sx={{
                   minWidth: 52,
@@ -581,7 +620,7 @@ function StageFlowDiagram({ stages }: { stages: OrchestrationStageRun[] }) {
               <IconButton
                 size="small"
                 aria-label="Zoom in stage flow"
-                onClick={() => setZoom((z) => clampFlowZoom(z + FLOW_ZOOM_STEP))}
+                onClick={() => applyZoom((z) => clampFlowZoom(z + FLOW_ZOOM_STEP), { autoFit: false })}
                 disabled={zoom >= FLOW_ZOOM_MAX}
               >
                 <ZoomInIcon fontSize="small" />
@@ -589,7 +628,11 @@ function StageFlowDiagram({ stages }: { stages: OrchestrationStageRun[] }) {
             </span>
           </Tooltip>
           <Tooltip title="Fit to window">
-            <IconButton size="small" aria-label="Fit stage flow to window" onClick={fitToWindow}>
+            <IconButton
+              size="small"
+              aria-label="Fit stage flow to window"
+              onClick={() => fitToWindow({ userInitiated: true })}
+            >
               <FitScreenIcon fontSize="small" />
             </IconButton>
           </Tooltip>
@@ -602,9 +645,9 @@ function StageFlowDiagram({ stages }: { stages: OrchestrationStageRun[] }) {
         }}
       >
         {/*
-          Wrapper is sized to the *visual* scaled bounds and clips layout overflow.
-          Without overflow:hidden, transform:scale() keeps the full unscaled layout
-          size in the scrollable area — which is what was clipping fit-to-window.
+          Spacer owns the *visual* scroll size (natural × zoom). Content is absolutely
+          positioned with width:max-content so the scaled wrapper never shrink-to-fits
+          the diagram and permanently clips stages under overflow:hidden.
         */}
         <Box
           sx={{
@@ -617,8 +660,12 @@ function StageFlowDiagram({ stages }: { stages: OrchestrationStageRun[] }) {
           <Box
             ref={contentRef}
             sx={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
               display: 'inline-flex',
               alignItems: 'stretch',
+              width: 'max-content',
               gap: 0,
               transform: `scale(${zoom})`,
               transformOrigin: 'top left',

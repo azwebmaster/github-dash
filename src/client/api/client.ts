@@ -11,6 +11,7 @@ import type {
   ReleaseDetail,
   ReleaseStats,
   ReleaseSummary,
+  WorkflowLifecycleMap,
   WorkflowRunDetail,
   WorkflowRunSummary,
   WorkflowStats,
@@ -91,6 +92,7 @@ export const api = {
     request<{ items: WorkflowRunSummary[]; stats: WorkflowStats }>(
       `/api/workflows?${limitQuery(limit)}`,
     ),
+  workflowMap: () => request<WorkflowLifecycleMap>('/api/workflows/map'),
   workflowRuns: (workflowId: number, limit: RunLimit = DEFAULT_RUN_LIMIT) =>
     request<{ workflowId: number; name: string; items: WorkflowRunSummary[] }>(
       `/api/workflows/by/${workflowId}?${limitQuery(limit)}`,

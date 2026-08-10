@@ -1,10 +1,13 @@
 import { useState } from 'react';
 import {
+  Box,
   Chip,
   IconButton,
   Link,
   Paper,
   Stack,
+  Tab,
+  Tabs,
   Table,
   TableBody,
   TableCell,
@@ -23,6 +26,7 @@ import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
 import { usePinnedWorkflows } from '../hooks/usePinnedWorkflows';
 import { WorkflowSummaryCard } from '../components/WorkflowSummaryCard';
+import { WorkflowLifecycleDiagram } from '../components/WorkflowLifecycleDiagram';
 import { ConclusionStrip, DurationSparkline } from '../components/CiHealthVisuals';
 import { ErrorState, LoadingBlock, PageHeader, RunLimitFilter, StatTile, formatDate } from '../components/ui';
 import {
@@ -87,7 +91,7 @@ function conclusionChip(conclusion: string | null, status: string | null) {
   }
 }
 
-export default function WorkflowsPage() {
+function WorkflowsOverviewTab() {
   const navigate = useNavigate();
   const [runLimit, setRunLimit] = useState<RunLimit>(DEFAULT_RUN_LIMIT);
   const [sortKey, setSortKey] = useState<SortKey>('name');
@@ -115,11 +119,9 @@ export default function WorkflowsPage() {
 
   return (
     <Stack spacing={3}>
-      <PageHeader
-        title="Workflows"
-        subtitle="All workflows in the repo. Per-workflow stats use each workflow’s last 20 runs; the table below is a repo-wide recent sample"
-        action={<RunLimitFilter value={runLimit} onChange={setRunLimit} />}
-      />
+      <Stack direction="row" justifyContent="flex-end">
+        <RunLimitFilter value={runLimit} onChange={setRunLimit} />
+      </Stack>
 
       {pinnedIds.length > 0 ? (
         <Stack spacing={1.5}>
@@ -366,6 +368,40 @@ export default function WorkflowsPage() {
           </TableBody>
         </Table>
       </TableContainer>
+    </Stack>
+  );
+}
+
+export default function WorkflowsPage() {
+  const [tab, setTab] = useState(0);
+  /** Mount Diagram only after first visit; keep mounted so we do not refetch on tab switches. */
+  const [diagramVisited, setDiagramVisited] = useState(false);
+
+  return (
+    <Stack spacing={3}>
+      <PageHeader
+        title="Workflows"
+        subtitle="Actions health and when each workflow runs in the PR → merge queue → push → release path"
+      />
+
+      <Tabs
+        value={tab}
+        onChange={(_, next: number) => {
+          setTab(next);
+          if (next === 1) setDiagramVisited(true);
+        }}
+        sx={{ borderBottom: 1, borderColor: 'divider', minHeight: 40 }}
+      >
+        <Tab label="Overview" sx={{ minHeight: 40 }} />
+        <Tab label="Diagram" sx={{ minHeight: 40 }} />
+      </Tabs>
+
+      {tab === 0 ? <WorkflowsOverviewTab /> : null}
+      {diagramVisited ? (
+        <Box sx={{ display: tab === 1 ? 'block' : 'none' }} aria-hidden={tab !== 1}>
+          <WorkflowLifecycleDiagram />
+        </Box>
+      ) : null}
     </Stack>
   );
 }

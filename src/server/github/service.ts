@@ -17,6 +17,8 @@ import type {
   ReleaseSummary,
   RepoRef,
   WorkflowConclusionKind,
+  WorkflowLifecycleMap,
+  WorkflowMapEntry,
   WorkflowRunDetail,
   WorkflowRunSummary,
   WorkflowStats,
@@ -42,6 +44,12 @@ import {
 import { createCache, resolveCacheTtlMs, resolveMaxPages, type CacheStore } from '../cache/index.js';
 import { loadOrchestrationFromArtifacts } from './orchestration.js';
 import { fetchRecentRunsPerWorkflowGraphql } from './workflow-runs-graphql.js';
+import {
+  extractWorkflowTriggers,
+  LIFECYCLE_LANE_META,
+  LIFECYCLE_LANE_ORDER,
+  lanesForTriggers,
+} from './workflow-triggers.js';
 
 const CI_RECENT_CONCLUSION_COUNT = 12;
 const ORCHESTRATION_HEALTH_SAMPLE = 10;
@@ -1230,6 +1238,88 @@ export class GitHubService {
         .map(([date, v]) => ({ date, ...v }))
         .sort((a, b) => a.date.localeCompare(b.date)),
     };
+  }
+
+  /**
+   * Map workflows into lifecycle lanes (PR → merge queue → push → release, …)
+   * using workflow YAML `on:` triggers, falling back to recent run events.
+   */
+  async getWorkflowLifecycleMap(): Promise<WorkflowLifecycleMap> {
+    return this.cached(this.cacheKey('workflow-map', 'v1'), async () => {
+      const { workflows, runsByWorkflowId } = await this.listRecentRunsPerWorkflow(
+        PER_WORKFLOW_RUN_SAMPLE,
+      );
+
+      const entries = await mapPool(workflows, 8, async (wf): Promise<WorkflowMapEntry> => {
+        const observedEvents = [
+          ...new Set((runsByWorkflowId.get(wf.id) ?? []).map((r) => r.event).filter(Boolean)),
+        ].sort();
+
+        let triggers: string[] = [];
+        let pathFiltered = false;
+        let source: WorkflowMapEntry['source'] = 'unknown';
+
+        if (wf.path.startsWith('.github/workflows/') && /\.ya?ml$/i.test(wf.path)) {
+          try {
+            const { data } = await this.octokit.repos.getContent({
+              owner: this.ref.owner,
+              repo: this.ref.repo,
+              path: wf.path,
+            });
+            if (!Array.isArray(data) && data.type === 'file' && 'content' in data && data.content) {
+              const raw = Buffer.from(data.content, 'base64').toString('utf8');
+              const parsed = extractWorkflowTriggers(raw);
+              if (parsed.events.length > 0) {
+                triggers = parsed.events;
+                pathFiltered = parsed.hasPathFilters;
+                source = 'yaml';
+              }
+            }
+          } catch {
+            // Fall through to observed events.
+          }
+        }
+
+        if (source === 'unknown' && observedEvents.length > 0) {
+          triggers = observedEvents;
+          source = 'observed';
+        }
+
+        return {
+          workflowId: wf.id,
+          name: wf.name,
+          path: wf.path,
+          state: wf.state,
+          triggers,
+          lanes: lanesForTriggers(triggers, wf.name),
+          pathFiltered,
+          source,
+        };
+      });
+
+      const sorted = [...entries].sort((a, b) =>
+        a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
+      );
+
+      const lanes = LIFECYCLE_LANE_ORDER.map((id) => {
+        const meta = LIFECYCLE_LANE_META[id];
+        return {
+          id,
+          label: meta.label,
+          description: meta.description,
+          primary: meta.primary,
+          workflows: sorted.filter((w) => w.lanes.includes(id)),
+        };
+      }).filter((lane) => lane.workflows.length > 0);
+
+      return {
+        lanes,
+        workflows: sorted,
+        parsedFromYaml: sorted.filter((w) => w.source === 'yaml').length,
+        observedOnly: sorted.filter((w) => w.source === 'observed').length,
+        unknown: sorted.filter((w) => w.source === 'unknown').length,
+      };
+    });
   }
 
   /**
