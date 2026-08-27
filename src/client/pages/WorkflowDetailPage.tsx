@@ -140,6 +140,12 @@ function confidenceColor(
   return 'default';
 }
 
+/** Prefer `likelyCauses`; fall back to legacy single `likelyCause` from older cache entries. */
+function analysisLikelyCauses(analysis: WorkflowFailureAnalysis) {
+  if (analysis.likelyCauses?.length) return analysis.likelyCauses;
+  return analysis.likelyCause ? [analysis.likelyCause] : [];
+}
+
 type AnalysisLogEntry = {
   id: number;
   role: 'system' | 'assistant' | 'tool' | 'status';
@@ -271,6 +277,7 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
   const [analysis, setAnalysis] = useState<WorkflowFailureAnalysis | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingCache, setLoadingCache] = useState(true);
   const [status, setStatus] = useState<string | null>(null);
   const [logEntries, setLogEntries] = useState<AnalysisLogEntry[]>([]);
   const logIdRef = useRef(0);
@@ -281,6 +288,39 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
       abortRef.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingCache(true);
+    setAnalysis(null);
+    setError(null);
+    setStatus(null);
+    setLogEntries([]);
+    logIdRef.current = 0;
+
+    void (async () => {
+      try {
+        const cached = await api.getWorkflowAnalysis(runId);
+        if (cancelled) return;
+        if (cached) {
+          setAnalysis(cached);
+          setStatus(
+            cached.analyzedAt
+              ? `Loaded cached analysis from ${formatDate(cached.analyzedAt)}`
+              : 'Loaded cached analysis',
+          );
+        }
+      } catch {
+        // No cache / transient error — user can still run Analyze.
+      } finally {
+        if (!cancelled) setLoadingCache(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
 
   const appendLog = (role: AnalysisLogEntry['role'], text: string) => {
     const trimmed = text.trim();
@@ -315,20 +355,21 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
     }
   };
 
-  const runAnalysis = async () => {
+  const runAnalysis = async (refresh: boolean) => {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
     setLoading(true);
     setError(null);
-    setStatus('Starting…');
+    setStatus(refresh ? 'Re-analyzing…' : 'Starting…');
     setLogEntries([]);
     logIdRef.current = 0;
 
     try {
       const result = await api.analyzeWorkflowStream(runId, handleEvent, {
         signal: controller.signal,
+        refresh,
       });
       setAnalysis(result);
     } catch (err) {
@@ -367,15 +408,15 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
             </Stack>
             <Typography variant="body2" color="text.secondary">
               Uses release notes and orchestration stage test reports to identify the likely PR and
-              author.
+              author. Results are cached so revisiting a run does not re-run Claude.
             </Typography>
           </Stack>
           <Button
             variant="contained"
             color="secondary"
             startIcon={loading ? <CircularProgress size={16} color="inherit" /> : <AutoAwesomeIcon />}
-            onClick={() => void runAnalysis()}
-            disabled={loading}
+            onClick={() => void runAnalysis(Boolean(analysis))}
+            disabled={loading || loadingCache}
           >
             {loading ? 'Analyzing…' : analysis ? 'Re-analyze' : 'Analyze failure'}
           </Button>
@@ -397,6 +438,14 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
             <Typography>{analysis.summary}</Typography>
 
             <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+              {analysis.analyzedAt ? (
+                <Chip
+                  size="small"
+                  label={`cached ${formatDate(analysis.analyzedAt)}`}
+                  variant="outlined"
+                  color="secondary"
+                />
+              ) : null}
               {analysis.tagName ? (
                 <Chip size="small" label={`tag ${analysis.tagName}`} variant="outlined" />
               ) : null}
@@ -422,34 +471,66 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
 
             <Paper variant="outlined" sx={{ p: 2, bgcolor: 'action.hover' }}>
               <Typography variant="overline" color="text.secondary">
-                Likely cause
+                Likely causes
               </Typography>
-              <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mt: 0.5 }}>
-                {analysis.likelyCause.prNumber != null ? (
-                  <Link
-                    component={RouterLink}
-                    to={`/prs/${analysis.likelyCause.prNumber}`}
-                    underline="hover"
-                    fontWeight={700}
-                  >
-                    #{analysis.likelyCause.prNumber}
-                    {analysis.likelyCause.prTitle ? ` · ${analysis.likelyCause.prTitle}` : ''}
-                  </Link>
+              <Stack spacing={1.25} sx={{ mt: 0.5 }}>
+                {analysisLikelyCauses(analysis).length === 0 ? (
+                  <Typography fontWeight={700}>No likely causes identified</Typography>
                 ) : (
-                  <Typography fontWeight={700}>No single PR identified</Typography>
+                  analysisLikelyCauses(analysis).map((cause, index) => (
+                    <Stack
+                      key={`${cause.prNumber ?? 'none'}-${index}`}
+                      spacing={0.5}
+                      sx={{
+                        pl: 1.5,
+                        borderLeft: 2,
+                        borderColor:
+                          index === 0 ? 'secondary.main' : 'divider',
+                      }}
+                    >
+                      <Stack
+                        direction="row"
+                        spacing={1}
+                        alignItems="center"
+                        flexWrap="wrap"
+                        useFlexGap
+                      >
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ fontFamily: '"IBM Plex Mono", monospace', minWidth: 1.5 }}
+                        >
+                          {index + 1}.
+                        </Typography>
+                        {cause.prNumber != null ? (
+                          <Link
+                            component={RouterLink}
+                            to={`/prs/${cause.prNumber}`}
+                            underline="hover"
+                            fontWeight={700}
+                          >
+                            #{cause.prNumber}
+                            {cause.prTitle ? ` · ${cause.prTitle}` : ''}
+                          </Link>
+                        ) : (
+                          <Typography fontWeight={700}>No single PR identified</Typography>
+                        )}
+                        {cause.author ? (
+                          <Chip size="small" label={`@${cause.author}`} color="secondary" />
+                        ) : null}
+                        <Chip
+                          size="small"
+                          label={`${cause.confidence} confidence`}
+                          color={confidenceColor(cause.confidence)}
+                        />
+                      </Stack>
+                      <Typography variant="body2" color="text.secondary">
+                        {cause.reasoning}
+                      </Typography>
+                    </Stack>
+                  ))
                 )}
-                {analysis.likelyCause.author ? (
-                  <Chip size="small" label={`@${analysis.likelyCause.author}`} color="secondary" />
-                ) : null}
-                <Chip
-                  size="small"
-                  label={`${analysis.likelyCause.confidence} confidence`}
-                  color={confidenceColor(analysis.likelyCause.confidence)}
-                />
               </Stack>
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                {analysis.likelyCause.reasoning}
-              </Typography>
             </Paper>
 
             <FailedStageTestChips analysis={analysis} />
@@ -460,18 +541,23 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
                   PRs from release notes
                 </Typography>
                 <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                  {analysis.associatedPrs.map((pr) => (
-                    <Chip
-                      key={pr.number}
-                      size="small"
-                      component={RouterLink}
-                      to={`/prs/${pr.number}`}
-                      clickable
-                      label={`#${pr.number}${pr.author ? ` @${pr.author}` : ''}`}
-                      color={pr.number === analysis.likelyCause.prNumber ? 'secondary' : 'default'}
-                      variant={pr.number === analysis.likelyCause.prNumber ? 'filled' : 'outlined'}
-                    />
-                  ))}
+                  {analysis.associatedPrs.map((pr) => {
+                    const implicated = analysisLikelyCauses(analysis).some(
+                      (cause) => cause.prNumber === pr.number,
+                    );
+                    return (
+                      <Chip
+                        key={pr.number}
+                        size="small"
+                        component={RouterLink}
+                        to={`/prs/${pr.number}`}
+                        clickable
+                        label={`#${pr.number}${pr.author ? ` @${pr.author}` : ''}`}
+                        color={implicated ? 'secondary' : 'default'}
+                        variant={implicated ? 'filled' : 'outlined'}
+                      />
+                    );
+                  })}
                 </Stack>
               </Stack>
             ) : null}

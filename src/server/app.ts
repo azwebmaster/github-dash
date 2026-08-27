@@ -233,13 +233,18 @@ export function createApp(options: CreateAppOptions): Express {
         return;
       }
       const { analyzeWorkflowFailure } = await import('./github/failure-analysis.js');
+      const refresh =
+        req.query.refresh === '1' ||
+        req.query.refresh === 'true' ||
+        req.query.force === '1' ||
+        req.query.force === 'true';
       const wantsStream =
         req.query.stream === '1' ||
         req.query.stream === 'true' ||
         String(req.headers.accept ?? '').includes('application/x-ndjson');
 
       if (!wantsStream) {
-        res.json(await analyzeWorkflowFailure(github, id));
+        res.json(await analyzeWorkflowFailure(github, id, { refresh }));
         return;
       }
 
@@ -258,13 +263,37 @@ export function createApp(options: CreateAppOptions): Express {
       };
 
       try {
-        await analyzeWorkflowFailure(github, id, writeEvent);
+        await analyzeWorkflowFailure(github, id, { refresh, onProgress: writeEvent });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         writeEvent({ type: 'error', message });
       } finally {
         if (!res.writableEnded) res.end();
       }
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/workflows/:id/analyze', async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id)) {
+        res.status(400).json({ error: 'Invalid workflow run id' });
+        return;
+      }
+      const stored = await github.getCachedFailureAnalysis(id);
+      if (!stored) {
+        res.status(404).json({ error: 'No cached analysis for this workflow run' });
+        return;
+      }
+      const { normalizeFailureAnalysis } = await import('./github/failure-analysis.js');
+      res.json(
+        normalizeFailureAnalysis({
+          ...stored.analysis,
+          analyzedAt: stored.analyzedAt,
+        }),
+      );
     } catch (err) {
       next(err);
     }
