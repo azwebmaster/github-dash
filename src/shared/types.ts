@@ -382,6 +382,50 @@ export type WorkflowFailureNotesSource = 'orchestration' | 'github_release' | 'n
 
 export type WorkflowFailureConfidence = 'high' | 'medium' | 'low';
 
+/** Compact test suite snapshot used in failure analysis context. */
+export interface WorkflowFailureTestSuite {
+  key: string;
+  label: string;
+  status: string;
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  failedShards: number[];
+  failedTests: string[];
+  failedTestsOverflow: number;
+}
+
+/** Compact test report from an orchestration stage for AI analysis. */
+export interface WorkflowFailureTestReport {
+  environment: string;
+  overall: string;
+  testJobResult: string;
+  mergeResult: string;
+  hostPaasResult: string;
+  infraFailure: boolean;
+  hostPaas: { present: boolean; status: string };
+  suites: WorkflowFailureTestSuite[];
+}
+
+export interface WorkflowFailureStage {
+  id: string;
+  name: string;
+  error: string;
+  env: string;
+  statusText: string;
+  testSummary: boolean;
+  /** Present when the stage carried a TestReport in state.json. */
+  testReport: WorkflowFailureTestReport | null;
+}
+
+/** Streaming progress / chat-log events while analysis runs. */
+export type WorkflowFailureAnalysisEvent =
+  | { type: 'status'; message: string }
+  | { type: 'log'; role: 'system' | 'assistant' | 'tool'; text: string }
+  | { type: 'result'; analysis: WorkflowFailureAnalysis }
+  | { type: 'error'; message: string };
+
 /** Claude Agent SDK analysis of a failed workflow run. */
 export interface WorkflowFailureAnalysis {
   runId: number;
@@ -405,11 +449,7 @@ export interface WorkflowFailureAnalysis {
     conclusion: string | null;
     failedSteps: string[];
   }>;
-  failedStages: Array<{
-    id: string;
-    name: string;
-    error: string;
-  }>;
+  failedStages: WorkflowFailureStage[];
   summary: string;
   likelyCause: {
     prNumber: number | null;

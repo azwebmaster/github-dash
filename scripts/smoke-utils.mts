@@ -225,9 +225,12 @@ on:
 }
 
 {
-  const { extractFailedJobs, extractFailedStages } = await import(
-    '../src/server/github/failure-analysis.ts'
-  );
+  const {
+    extractFailedJobs,
+    extractFailedStages,
+    compactTestReport,
+    describeSdkMessage,
+  } = await import('../src/server/github/failure-analysis.ts');
   const runBase = {
     id: 1,
     name: 'Release',
@@ -245,27 +248,28 @@ on:
     htmlUrl: 'https://example.com',
     attempt: 1,
   };
+  const stageDef = {
+    ID: 'deploy',
+    Name: 'Deploy',
+    Group: '',
+    Type: 'workflow',
+    Repo: '',
+    Workflow: '',
+    Ref: '',
+    ActiveRunCheck: null,
+    ActiveRunFilter: '',
+    Advisory: false,
+    TestSummary: true,
+    HostPaas: false,
+    Inputs: null,
+    Outputs: null,
+    Matrix: null,
+    Items: null,
+    URL: '',
+    ExpectVersion: '',
+  };
   const failedStage = {
-    Stage: {
-      ID: 'deploy',
-      Name: 'Deploy',
-      Group: '',
-      Type: 'workflow',
-      Repo: '',
-      Workflow: '',
-      Ref: '',
-      ActiveRunCheck: null,
-      ActiveRunFilter: '',
-      Advisory: false,
-      TestSummary: false,
-      HostPaas: false,
-      Inputs: null,
-      Outputs: null,
-      Matrix: null,
-      Items: null,
-      URL: '',
-      ExpectVersion: '',
-    },
+    Stage: stageDef,
     Env: 'prod',
     State: 4 as const,
     RunURL: '',
@@ -278,6 +282,38 @@ on:
     StatusText: '',
     MatrixRuns: null,
     TestReport: null,
+  };
+
+  const testReport = {
+    environment: 'staging',
+    overall: 'failed',
+    testJobResult: 'failure',
+    mergeResult: 'success',
+    hostPaasResult: '',
+    infraFailure: false,
+    suites: [
+      {
+        key: 'e2e',
+        label: 'E2E',
+        status: 'failed',
+        total: 10,
+        passed: 8,
+        failed: 2,
+        skipped: 0,
+        failedShards: [1],
+        failedTests: ['CheckoutPage loads', 'Cart applies coupon'],
+        failedTestsOverflow: 0,
+      },
+    ],
+    hostPaas: { present: false, status: '' },
+  };
+
+  const testStage = {
+    ...failedStage,
+    Stage: { ...stageDef, ID: 'qa', Name: 'QA' },
+    State: 3 as const,
+    Error: '',
+    TestReport: testReport,
   };
 
   assert.deepEqual(
@@ -343,7 +379,42 @@ on:
       },
       orchestrationArtifact: null,
     }),
-    [{ id: 'deploy', name: 'Deploy', error: 'image pull failed' }],
+    [
+      {
+        id: 'deploy',
+        name: 'Deploy',
+        error: 'image pull failed',
+        env: 'prod',
+        statusText: '',
+        testSummary: true,
+        testReport: null,
+      },
+    ],
+  );
+
+  const withTests = extractFailedStages({
+    ...runBase,
+    jobs: [],
+    orchestration: {
+      pipeline: { stages: [failedStage, testStage], values: {}, snapshot: {} },
+    },
+    orchestrationArtifact: null,
+  });
+  assert.equal(withTests.length, 2);
+  assert.equal(withTests[1].id, 'qa');
+  assert.deepEqual(withTests[1].testReport, compactTestReport(testReport));
+  assert.equal(withTests[1].testReport?.suites[0].failedTests[0], 'CheckoutPage loads');
+
+  assert.deepEqual(describeSdkMessage({ type: 'system', subtype: 'init', model: 'claude-sonnet' }), [
+    { type: 'status', message: 'Starting analysis with claude-sonnet' },
+    { type: 'log', role: 'system', text: 'Agent ready · model claude-sonnet' },
+  ]);
+  assert.deepEqual(
+    describeSdkMessage({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'Checking failed tests…' }] },
+    }),
+    [{ type: 'log', role: 'assistant', text: 'Checking failed tests…' }],
   );
 }
 

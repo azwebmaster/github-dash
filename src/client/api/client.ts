@@ -12,6 +12,7 @@ import type {
   ReleaseStats,
   ReleaseSummary,
   WorkflowFailureAnalysis,
+  WorkflowFailureAnalysisEvent,
   WorkflowLifecycleMap,
   WorkflowRunDetail,
   WorkflowRunSummary,
@@ -123,5 +124,71 @@ export const api = {
   },
   analyzeWorkflow: (id: number) =>
     request<WorkflowFailureAnalysis>(`/api/workflows/${id}/analyze`, { method: 'POST' }),
+  /**
+   * Stream failure analysis progress as NDJSON events.
+   * Invokes `onEvent` for status/log/result/error frames; resolves with the final analysis.
+   */
+  analyzeWorkflowStream: async (
+    id: number,
+    onEvent: (event: WorkflowFailureAnalysisEvent) => void,
+    opts?: { signal?: AbortSignal },
+  ): Promise<WorkflowFailureAnalysis> => {
+    const res = await fetch(`/api/workflows/${id}/analyze?stream=1`, {
+      method: 'POST',
+      headers: { Accept: 'application/x-ndjson' },
+      signal: opts?.signal,
+    });
+    if (!res.ok) {
+      let message = res.statusText;
+      try {
+        const body = (await res.json()) as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        // ignore
+      }
+      throw new Error(message || `Request failed (${res.status})`);
+    }
+    if (!res.body) {
+      throw new Error('Analysis stream returned an empty body');
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let analysis: WorkflowFailureAnalysis | null = null;
+    let streamError: string | null = null;
+
+    const handleLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let event: WorkflowFailureAnalysisEvent;
+      try {
+        event = JSON.parse(trimmed) as WorkflowFailureAnalysisEvent;
+      } catch {
+        return;
+      }
+      onEvent(event);
+      if (event.type === 'result') analysis = event.analysis;
+      if (event.type === 'error') streamError = event.message;
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIdx = buffer.indexOf('\n');
+      while (newlineIdx !== -1) {
+        handleLine(buffer.slice(0, newlineIdx));
+        buffer = buffer.slice(newlineIdx + 1);
+        newlineIdx = buffer.indexOf('\n');
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) handleLine(buffer);
+
+    if (streamError) throw new Error(streamError);
+    if (!analysis) throw new Error('Analysis stream ended without a result');
+    return analysis;
+  },
   orchestrationHealth: () => request<OrchestrationHealthSummary>('/api/orchestration/health'),
 };

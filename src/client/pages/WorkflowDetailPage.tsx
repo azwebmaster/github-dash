@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Alert,
+  Box,
   Button,
   Chip,
   CircularProgress,
@@ -29,7 +30,11 @@ import {
   findLongestStep,
 } from '../components/WorkflowJobsPanel';
 import { formatDurationSeconds } from '../../shared/utils';
-import type { WorkflowFailureAnalysis, WorkflowRunDetail } from '../../shared/types';
+import type {
+  WorkflowFailureAnalysis,
+  WorkflowFailureAnalysisEvent,
+  WorkflowRunDetail,
+} from '../../shared/types';
 
 type Job = WorkflowRunDetail['jobs'][number];
 
@@ -135,22 +140,205 @@ function confidenceColor(
   return 'default';
 }
 
+type AnalysisLogEntry = {
+  id: number;
+  role: 'system' | 'assistant' | 'tool' | 'status';
+  text: string;
+};
+
+function logRoleLabel(role: AnalysisLogEntry['role']): string {
+  if (role === 'assistant') return 'Claude';
+  if (role === 'tool') return 'Tool';
+  if (role === 'status') return 'Progress';
+  return 'System';
+}
+
+function logRoleColor(role: AnalysisLogEntry['role']): string {
+  if (role === 'assistant') return 'secondary.main';
+  if (role === 'tool') return 'info.main';
+  if (role === 'status') return 'warning.main';
+  return 'text.secondary';
+}
+
+function AnalysisProgressLog({
+  entries,
+  status,
+  loading,
+}: {
+  entries: AnalysisLogEntry[];
+  status: string | null;
+  loading: boolean;
+}) {
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [entries, status]);
+
+  if (!loading && entries.length === 0) return null;
+
+  return (
+    <Paper
+      variant="outlined"
+      sx={{
+        p: 0,
+        overflow: 'hidden',
+        bgcolor: 'rgba(15, 76, 92, 0.03)',
+      }}
+    >
+      <Stack
+        direction="row"
+        spacing={1}
+        alignItems="center"
+        sx={{ px: 1.5, py: 1, borderBottom: 1, borderColor: 'divider' }}
+      >
+        {loading ? <CircularProgress size={14} /> : null}
+        <Typography variant="caption" color="text.secondary">
+          {loading ? status || 'Analyzing…' : 'Analysis log'}
+        </Typography>
+      </Stack>
+      <Box
+        ref={scrollerRef}
+        sx={{
+          maxHeight: 260,
+          overflow: 'auto',
+          px: 1.5,
+          py: 1,
+          fontFamily: '"IBM Plex Mono", monospace',
+        }}
+      >
+        <Stack spacing={1}>
+          {entries.map((entry) => (
+            <Box key={entry.id}>
+              <Typography
+                variant="caption"
+                sx={{ color: logRoleColor(entry.role), fontWeight: 700, display: 'right' }}
+              >
+                {logRoleLabel(entry.role)}
+              </Typography>
+              <Typography
+                variant="body2"
+                sx={{
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  color: entry.role === 'status' ? 'text.secondary' : 'text.primary',
+                }}
+              >
+                {entry.text}
+              </Typography>
+            </Box>
+          ))}
+          {loading && entries.length === 0 ? (
+            <Typography variant="body2" color="text.secondary">
+              Waiting for agent events…
+            </Typography>
+          ) : null}
+        </Stack>
+      </Box>
+    </Paper>
+  );
+}
+
+function FailedStageTestChips({ analysis }: { analysis: WorkflowFailureAnalysis }) {
+  const withTests = analysis.failedStages.filter((s) => s.testReport);
+  if (withTests.length === 0) return null;
+
+  return (
+    <Stack spacing={0.75}>
+      <Typography variant="caption" color="text.secondary">
+        Stage test reports used in analysis
+      </Typography>
+      <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+        {withTests.map((stage) => {
+          const failedTests =
+            stage.testReport?.suites.reduce((n, s) => n + s.failedTests.length, 0) ?? 0;
+          const label = stage.testReport?.infraFailure
+            ? `${stage.name}: infra failure`
+            : failedTests > 0
+              ? `${stage.name}: ${failedTests} failed test${failedTests === 1 ? '' : 's'}`
+              : `${stage.name}: ${stage.testReport?.overall || 'tests'}`;
+          return <Chip key={stage.id} size="small" label={label} variant="outlined" color="error" />;
+        })}
+      </Stack>
+    </Stack>
+  );
+}
+
 function FailureAnalysisPanel({ runId }: { runId: number }) {
   const { data: meta } = useAsyncData(() => api.meta(), []);
   const [analysis, setAnalysis] = useState<WorkflowFailureAnalysis | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [logEntries, setLogEntries] = useState<AnalysisLogEntry[]>([]);
+  const logIdRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  const appendLog = (role: AnalysisLogEntry['role'], text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    logIdRef.current += 1;
+    const id = logIdRef.current;
+    setLogEntries((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && last.role === role && last.text === trimmed) return prev;
+      return [...prev, { id, role, text: trimmed }];
+    });
+  };
+
+  const handleEvent = (event: WorkflowFailureAnalysisEvent) => {
+    if (event.type === 'status') {
+      setStatus(event.message);
+      appendLog('status', event.message);
+      return;
+    }
+    if (event.type === 'log') {
+      appendLog(event.role, event.text);
+      return;
+    }
+    if (event.type === 'result') {
+      setAnalysis(event.analysis);
+      setStatus('Analysis complete');
+      return;
+    }
+    if (event.type === 'error') {
+      setError(event.message);
+      appendLog('system', event.message);
+    }
+  };
 
   const runAnalysis = async () => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
     setError(null);
+    setStatus('Starting…');
+    setLogEntries([]);
+    logIdRef.current = 0;
+
     try {
-      const result = await api.analyzeWorkflow(runId);
+      const result = await api.analyzeWorkflowStream(runId, handleEvent, {
+        signal: controller.signal,
+      });
       setAnalysis(result);
     } catch (err) {
+      if (controller.signal.aborted) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (abortRef.current === controller) {
+        setLoading(false);
+        abortRef.current = null;
+      }
     }
   };
 
@@ -178,7 +366,8 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
               <Typography variant="h6">Claude failure analysis</Typography>
             </Stack>
             <Typography variant="body2" color="text.secondary">
-              Uses release notes linked to this run’s tag to identify the likely PR and author.
+              Uses release notes and orchestration stage test reports to identify the likely PR and
+              author.
             </Typography>
           </Stack>
           <Button
@@ -198,6 +387,8 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
             <code>apiKeyHelper</code> (and related settings) in <code>~/.claude/settings.json</code>.
           </Alert>
         ) : null}
+
+        <AnalysisProgressLog entries={logEntries} status={status} loading={loading} />
 
         {error ? <Alert severity="error">{error}</Alert> : null}
 
@@ -260,6 +451,8 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
                 {analysis.likelyCause.reasoning}
               </Typography>
             </Paper>
+
+            <FailedStageTestChips analysis={analysis} />
 
             {analysis.associatedPrs.length > 0 ? (
               <Stack spacing={0.75}>
