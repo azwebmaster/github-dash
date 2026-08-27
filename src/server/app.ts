@@ -233,7 +233,38 @@ export function createApp(options: CreateAppOptions): Express {
         return;
       }
       const { analyzeWorkflowFailure } = await import('./github/failure-analysis.js');
-      res.json(await analyzeWorkflowFailure(github, id));
+      const wantsStream =
+        req.query.stream === '1' ||
+        req.query.stream === 'true' ||
+        String(req.headers.accept ?? '').includes('application/x-ndjson');
+
+      if (!wantsStream) {
+        res.json(await analyzeWorkflowFailure(github, id));
+        return;
+      }
+
+      res.status(200);
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('X-Accel-Buffering', 'no');
+      // Flush headers early so the client can start reading progress events.
+      if (typeof (res as { flushHeaders?: () => void }).flushHeaders === 'function') {
+        (res as { flushHeaders: () => void }).flushHeaders();
+      }
+
+      const writeEvent = (event: unknown) => {
+        if (res.writableEnded) return;
+        res.write(`${JSON.stringify(event)}\n`);
+      };
+
+      try {
+        await analyzeWorkflowFailure(github, id, writeEvent);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        writeEvent({ type: 'error', message });
+      } finally {
+        if (!res.writableEnded) res.end();
+      }
     } catch (err) {
       next(err);
     }

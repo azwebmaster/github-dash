@@ -4,9 +4,14 @@ import { join } from 'node:path';
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type {
+  OrchestrationStageRun,
+  OrchestrationTestReport,
   WorkflowFailureAnalysis,
+  WorkflowFailureAnalysisEvent,
   WorkflowFailureConfidence,
   WorkflowFailureNotesSource,
+  WorkflowFailureStage,
+  WorkflowFailureTestReport,
   WorkflowRunDetail,
 } from '../../shared/types.js';
 import {
@@ -14,6 +19,8 @@ import {
   resolveWorkflowRunTag,
 } from '../../shared/utils.js';
 import type { GitHubService } from './service.js';
+
+export type AnalysisProgressHandler = (event: WorkflowFailureAnalysisEvent) => void;
 
 /** Claude Code / Agent SDK user config directory (`CLAUDE_CONFIG_DIR` or `~/.claude`). */
 export function claudeConfigDir(): string {
@@ -103,11 +110,7 @@ export interface FailureAnalysisContext {
     conclusion: string | null;
     failedSteps: string[];
   }>;
-  failedStages: Array<{
-    id: string;
-    name: string;
-    error: string;
-  }>;
+  failedStages: WorkflowFailureStage[];
 }
 
 function isFailureConclusion(conclusion: string | null | undefined): boolean {
@@ -131,17 +134,91 @@ export function extractFailedJobs(run: WorkflowRunDetail): FailureAnalysisContex
     }));
 }
 
+const MAX_FAILED_TESTS_PER_SUITE = 40;
+
+/** Compact a stage TestReport for the analysis prompt / MCP context. */
+export function compactTestReport(
+  report: OrchestrationTestReport | null | undefined,
+): WorkflowFailureTestReport | null {
+  if (!report) return null;
+  return {
+    environment: report.environment ?? '',
+    overall: report.overall ?? '',
+    testJobResult: report.testJobResult ?? '',
+    mergeResult: report.mergeResult ?? '',
+    hostPaasResult: report.hostPaasResult ?? '',
+    infraFailure: Boolean(report.infraFailure),
+    hostPaas: {
+      present: Boolean(report.hostPaas?.present),
+      status: report.hostPaas?.status ?? '',
+    },
+    suites: (report.suites ?? []).map((suite) => ({
+      key: suite.key,
+      label: suite.label,
+      status: suite.status,
+      total: suite.total,
+      passed: suite.passed,
+      failed: suite.failed,
+      skipped: suite.skipped,
+      failedShards: suite.failedShards ?? [],
+      failedTests: (suite.failedTests ?? []).slice(0, MAX_FAILED_TESTS_PER_SUITE),
+      failedTestsOverflow:
+        (suite.failedTestsOverflow ?? 0) +
+        Math.max(0, (suite.failedTests?.length ?? 0) - MAX_FAILED_TESTS_PER_SUITE),
+    })),
+  };
+}
+
+function testReportLooksFailed(report: OrchestrationTestReport | null | undefined): boolean {
+  if (!report) return false;
+  if (report.infraFailure) return true;
+  const overall = (report.overall ?? '').toLowerCase();
+  if (overall && overall !== 'passed' && overall !== 'success' && overall !== 'ok') {
+    return true;
+  }
+  return (report.suites ?? []).some(
+    (suite) =>
+      suite.failed > 0 ||
+      (suite.failedTests?.length ?? 0) > 0 ||
+      suite.status === 'failed' ||
+      suite.status === 'failure',
+  );
+}
+
+function toFailureStage(stage: OrchestrationStageRun): WorkflowFailureStage {
+  return {
+    id: stage.Stage.ID || stage.Stage.Name,
+    name: stage.Stage.Name || stage.Stage.ID,
+    error: stage.Error || stage.StatusText || '',
+    env: stage.Env || '',
+    statusText: stage.StatusText || '',
+    testSummary: Boolean(stage.Stage.TestSummary),
+    testReport: compactTestReport(stage.TestReport),
+  };
+}
+
+/**
+ * Stages that failed (State=4) plus any stage whose TestReport indicates test/infra failure.
+ * Test report details are always attached when present so the agent can correlate failing tests.
+ */
 export function extractFailedStages(
   run: WorkflowRunDetail,
 ): FailureAnalysisContext['failedStages'] {
   const stages = run.orchestration?.pipeline.stages ?? [];
-  return stages
-    .filter((stage) => stage.State === ORCH_STAGE_FAILURE)
-    .map((stage) => ({
-      id: stage.Stage.ID || stage.Stage.Name,
-      name: stage.Stage.Name || stage.Stage.ID,
-      error: stage.Error || stage.StatusText || '',
-    }));
+  const selected: WorkflowFailureStage[] = [];
+  const seen = new Set<string>();
+
+  for (const stage of stages) {
+    const failed = stage.State === ORCH_STAGE_FAILURE || testReportLooksFailed(stage.TestReport);
+    if (!failed) continue;
+    const mapped = toFailureStage(stage);
+    const key = mapped.id || mapped.name;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    selected.push(mapped);
+  }
+
+  return selected;
 }
 
 export async function buildFailureAnalysisContext(
@@ -238,7 +315,7 @@ ${ctx.release ? `Release: ${ctx.release.name} (${ctx.release.htmlUrl})` : 'No Gi
 ## Failed jobs / steps
 ${JSON.stringify(ctx.failedJobs, null, 2)}
 
-## Failed orchestration stages
+## Failed orchestration stages (include TestReport / failed tests when present)
 ${JSON.stringify(ctx.failedStages, null, 2)}
 
 ## PRs parsed from release notes
@@ -253,15 +330,16 @@ ${notesPreview || '(no release notes available)'}
 ## Instructions
 1. Call get_failure_context if you need to re-read the structured context.
 2. Call get_pr_detail for any candidate PR you need more detail on (title, body, files, author).
-3. Prefer correlating failed job/stage/test names with PR titles, file paths, and release-note lines.
-4. Pick at most one likely PR from the release-notes list. If evidence is weak, set likelyPrNumber to null and confidence to low.
-5. Return structured output only.`;
+3. Prefer correlating failed job/stage names, TestReport suite names, and failedTests with PR titles, file paths, and release-note lines.
+4. Treat infraFailure / hostPaas / mergeResult signals as distinct from application test failures when assigning blame.
+5. Pick at most one likely PR from the release-notes list. If evidence is weak, set likelyPrNumber to null and confidence to low.
+6. Return structured output only.`;
 }
 
 function createAnalysisMcpServer(ctx: FailureAnalysisContext, github: GitHubService) {
   const getFailureContext = tool(
     'get_failure_context',
-    'Return the structured workflow failure context including tag, release notes metadata, failed jobs/stages, and associated PRs.',
+    'Return the structured workflow failure context including tag, release notes metadata, failed jobs/stages (with TestReport / failed tests when present), and associated PRs.',
     {},
     async () => ({
       content: [
@@ -366,9 +444,154 @@ export function isClaudeAgentConfigured(): boolean {
   );
 }
 
+function contentBlocks(value: unknown): unknown[] {
+  if (!value || typeof value !== 'object') return [];
+  const content = (value as { content?: unknown }).content;
+  if (typeof content === 'string') return [{ type: 'text', text: content }];
+  return Array.isArray(content) ? content : [];
+}
+
+function textFromBlocks(blocks: unknown[]): string {
+  const parts: string[] = [];
+  for (const block of blocks) {
+    if (!block || typeof block !== 'object') continue;
+    const b = block as { type?: string; text?: string; name?: string; input?: unknown };
+    if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
+      parts.push(b.text.trim());
+    } else if (b.type === 'tool_use' && typeof b.name === 'string') {
+      const inputPreview =
+        b.input && typeof b.input === 'object'
+          ? JSON.stringify(b.input)
+          : '';
+      parts.push(
+        inputPreview && inputPreview.length < 200
+          ? `Calling ${b.name}(${inputPreview})`
+          : `Calling ${b.name}`,
+      );
+    } else if (b.type === 'thinking' && typeof b.text === 'string' && b.text.trim()) {
+      // Skip raw thinking blobs in the chat log — too noisy.
+    }
+  }
+  return parts.join('\n');
+}
+
+function toolResultPreview(blocks: unknown[]): string {
+  const parts: string[] = [];
+  for (const block of blocks) {
+    if (!block || typeof block !== 'object') continue;
+    const b = block as { type?: string; content?: unknown; is_error?: boolean; name?: string };
+    if (b.type !== 'tool_result') continue;
+    const prefix = b.is_error ? 'Tool error' : 'Tool result';
+    let body = '';
+    if (typeof b.content === 'string') body = b.content;
+    else if (Array.isArray(b.content)) {
+      body = b.content
+        .map((c) =>
+          c && typeof c === 'object' && 'text' in c && typeof (c as { text: unknown }).text === 'string'
+            ? (c as { text: string }).text
+            : '',
+        )
+        .filter(Boolean)
+        .join('\n');
+    }
+    const trimmed = body.trim().replace(/\s+/g, ' ');
+    parts.push(
+      trimmed
+        ? `${prefix}: ${trimmed.length > 280 ? `${trimmed.slice(0, 280)}…` : trimmed}`
+        : prefix,
+    );
+  }
+  return parts.join('\n');
+}
+
+/** Map a Claude Agent SDK message into optional chat/status lines for the UI. */
+export function describeSdkMessage(message: {
+  type: string;
+  [key: string]: unknown;
+}): Array<Extract<WorkflowFailureAnalysisEvent, { type: 'status' | 'log' }>> {
+  const events: Array<Extract<WorkflowFailureAnalysisEvent, { type: 'status' | 'log' }>> = [];
+
+  if (message.type === 'system') {
+    const subtype = typeof message.subtype === 'string' ? message.subtype : '';
+    if (subtype === 'init') {
+      const model = typeof message.model === 'string' ? message.model : 'Claude';
+      events.push({ type: 'status', message: `Starting analysis with ${model}` });
+      events.push({
+        type: 'log',
+        role: 'system',
+        text: `Agent ready · model ${model}`,
+      });
+    } else if (subtype === 'status') {
+      const status = message.status;
+      if (status === 'compacting') {
+        events.push({ type: 'status', message: 'Compacting context…' });
+      } else if (status === 'requesting') {
+        events.push({ type: 'status', message: 'Waiting on model…' });
+      }
+    }
+    return events;
+  }
+
+  if (message.type === 'assistant') {
+    const text = textFromBlocks(contentBlocks(message.message));
+    if (text) events.push({ type: 'log', role: 'assistant', text });
+    return events;
+  }
+
+  if (message.type === 'user') {
+    const text = toolResultPreview(contentBlocks(message.message));
+    if (text) events.push({ type: 'log', role: 'tool', text });
+    return events;
+  }
+
+  if (message.type === 'tool_progress') {
+    const name = typeof message.tool_name === 'string' ? message.tool_name : 'tool';
+    const elapsed =
+      typeof message.elapsed_time_seconds === 'number'
+        ? ` (${Math.round(message.elapsed_time_seconds)}s)`
+        : '';
+    events.push({
+      type: 'status',
+      message: `Running ${name.replace(/^mcp__github-dash__/, '')}${elapsed}…`,
+    });
+    return events;
+  }
+
+  if (message.type === 'result') {
+    const subtype = typeof message.subtype === 'string' ? message.subtype : '';
+    if (subtype === 'success') {
+      events.push({ type: 'status', message: 'Analysis complete' });
+    } else {
+      events.push({ type: 'status', message: `Agent finished (${subtype || 'error'})` });
+    }
+  }
+
+  return events;
+}
+
+function summarizeContextForProgress(ctx: FailureAnalysisContext): string {
+  const stageBits = ctx.failedStages.map((stage) => {
+    const failedSuites =
+      stage.testReport?.suites.filter((s) => s.failed > 0 || s.failedTests.length > 0) ?? [];
+    const testCount = failedSuites.reduce((n, s) => n + s.failedTests.length, 0);
+    if (testCount > 0) return `${stage.name} (${testCount} failed test${testCount === 1 ? '' : 's'})`;
+    if (stage.testReport?.infraFailure) return `${stage.name} (infra failure)`;
+    if (stage.testReport) return `${stage.name} (tests: ${stage.testReport.overall || 'reported'})`;
+    return stage.name;
+  });
+  const parts = [
+    `${ctx.failedJobs.length} failed job${ctx.failedJobs.length === 1 ? '' : 's'}`,
+    `${ctx.failedStages.length} failed stage${ctx.failedStages.length === 1 ? '' : 's'}`,
+    `${ctx.associatedPrs.length} PR${ctx.associatedPrs.length === 1 ? '' : 's'} from notes`,
+  ];
+  if (stageBits.length) parts.push(`stages: ${stageBits.join(', ')}`);
+  return parts.join(' · ');
+}
+
 export async function runClaudeFailureAnalysis(
   github: GitHubService,
   ctx: FailureAnalysisContext,
+  onProgress?: AnalysisProgressHandler,
 ): Promise<Pick<WorkflowFailureAnalysis, 'summary' | 'likelyCause' | 'model'>> {
   if (!isClaudeAgentConfigured()) {
     const err = new Error(
@@ -377,6 +600,21 @@ export async function runClaudeFailureAnalysis(
     (err as Error & { status: number }).status = 503;
     throw err;
   }
+
+  const emit = (event: WorkflowFailureAnalysisEvent) => {
+    try {
+      onProgress?.(event);
+    } catch {
+      // Progress listeners must not break analysis.
+    }
+  };
+
+  emit({ type: 'status', message: 'Preparing Claude Agent…' });
+  emit({
+    type: 'log',
+    role: 'system',
+    text: `Context ready · ${summarizeContextForProgress(ctx)}`,
+  });
 
   const mcpServer = createAnalysisMcpServer(ctx, github);
   const schema = z.toJSONSchema(analysisOutputSchema, { target: 'draft-7' });
@@ -410,6 +648,11 @@ export async function runClaudeFailureAnalysis(
       if (message.type === 'system' && 'model' in message && typeof message.model === 'string') {
         model = message.model;
       }
+
+      for (const event of describeSdkMessage(message as { type: string; [key: string]: unknown })) {
+        emit(event);
+      }
+
       if (message.type === 'result') {
         if ('structured_output' in message && message.structured_output) {
           const parsed = analysisOutputSchema.safeParse(message.structured_output);
@@ -463,12 +706,35 @@ export async function runClaudeFailureAnalysis(
 export async function analyzeWorkflowFailure(
   github: GitHubService,
   runId: number,
+  onProgress?: AnalysisProgressHandler,
 ): Promise<WorkflowFailureAnalysis> {
-  const run = await github.getWorkflowRun(runId, { includeOrchestration: true });
-  const ctx = await buildFailureAnalysisContext(github, run);
-  const agent = await runClaudeFailureAnalysis(github, ctx);
+  const emit = (event: WorkflowFailureAnalysisEvent) => {
+    try {
+      onProgress?.(event);
+    } catch {
+      // ignore listener errors
+    }
+  };
 
-  return {
+  emit({ type: 'status', message: 'Loading workflow run and orchestration state…' });
+  const run = await github.getWorkflowRun(runId, { includeOrchestration: true });
+
+  emit({ type: 'status', message: 'Building failure context (jobs, stages, test reports, release notes)…' });
+  const ctx = await buildFailureAnalysisContext(github, run);
+
+  const testStageCount = ctx.failedStages.filter((s) => s.testReport).length;
+  emit({
+    type: 'log',
+    role: 'system',
+    text:
+      testStageCount > 0
+        ? `Included TestReport data for ${testStageCount} stage${testStageCount === 1 ? '' : 's'}.`
+        : 'No TestReport data found on failed stages.',
+  });
+
+  const agent = await runClaudeFailureAnalysis(github, ctx, onProgress);
+
+  const analysis: WorkflowFailureAnalysis = {
     runId: run.id,
     tagName: ctx.tagName,
     release: ctx.release
@@ -487,4 +753,7 @@ export async function analyzeWorkflowFailure(
     likelyCause: agent.likelyCause,
     model: agent.model,
   };
+
+  emit({ type: 'result', analysis });
+  return analysis;
 }
