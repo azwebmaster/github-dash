@@ -209,12 +209,17 @@ function AnalysisProgressLog({
 
   return (
     <Accordion
+      // Remount when a run finishes so a fast analyze cannot leave MUI stuck open.
+      key={loading ? 'analyzing' : 'complete'}
       disableGutters
       elevation={0}
       expanded={expanded}
       onChange={(_event, next) => {
         if (loading) return;
         setUserOpen(next);
+      }}
+      slotProps={{
+        transition: { unmountOnExit: true },
       }}
       sx={{
         border: 1,
