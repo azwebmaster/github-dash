@@ -21,6 +21,33 @@ import {
 } from '../../shared/utils.js';
 import type { GitHubService } from './service.js';
 
+/**
+ * Normalize analysis payloads (including older cached entries that only had `likelyCause`).
+ */
+export function normalizeFailureAnalysis(
+  analysis: WorkflowFailureAnalysis,
+): WorkflowFailureAnalysis {
+  const likelyCauses =
+    analysis.likelyCauses?.length > 0
+      ? analysis.likelyCauses
+      : analysis.likelyCause
+        ? [analysis.likelyCause]
+        : [
+            {
+              prNumber: null,
+              prTitle: null,
+              author: null,
+              confidence: 'low' as const,
+              reasoning: 'No likely cause recorded.',
+            },
+          ];
+  return {
+    ...analysis,
+    likelyCauses,
+    likelyCause: likelyCauses[0]!,
+  };
+}
+
 export type AnalysisProgressHandler = (event: WorkflowFailureAnalysisEvent) => void;
 
 export interface AnalyzeWorkflowFailureOptions {
@@ -68,20 +95,30 @@ function settingsEnvString(settings: ClaudeUserSettings | null, key: string): st
 
 const ORCH_STAGE_FAILURE = 4;
 
-const analysisOutputSchema = z.object({
-  summary: z.string().describe('1-3 sentence summary of what failed'),
-  likelyPrNumber: z
+const analysisCauseSchema = z.object({
+  prNumber: z
     .number()
     .nullable()
-    .describe('PR number from release notes most likely related to the failure, or null'),
-  likelyAuthor: z
+    .describe('PR number from release notes related to this cause, or null'),
+  author: z
     .string()
     .nullable()
-    .describe('GitHub login of the likely PR author, or null'),
+    .describe('GitHub login of the PR author for this cause, or null'),
   confidence: z.enum(['high', 'medium', 'low']),
   reasoning: z
     .string()
     .describe('Why this PR/author is implicated, citing release notes and failure signals'),
+});
+
+const analysisOutputSchema = z.object({
+  summary: z.string().describe('1-3 sentence summary of what failed'),
+  likelyCauses: z
+    .array(analysisCauseSchema)
+    .min(1)
+    .max(5)
+    .describe(
+      'Ranked likely causes (most likely first). Each entry is a separate suspect with its own reason.',
+    ),
 });
 
 export type AnalysisOutput = z.infer<typeof analysisOutputSchema>;
@@ -373,8 +410,10 @@ ${notesPreview || '(no release notes available)'}
 2. Call get_pr_detail for any candidate PR you need more detail on (title, body, files, author).
 3. Prefer correlating failed job/stage names, TestReport suite names, and failedTests with PR titles, file paths, and release-note lines.
 4. Treat infraFailure / hostPaas / mergeResult signals as distinct from application test failures when assigning blame.
-5. Pick at most one likely PR from the release-notes list. If evidence is weak, set likelyPrNumber to null and confidence to low.
-6. Return structured output only.`;
+5. Return likelyCauses as a ranked list (most likely first). Each cause must be a separate entry with its own reasoning.
+6. Include every plausible PR from the release-notes list that has supporting evidence (up to 5). Do not merge multiple PRs into one cause.
+7. If evidence is weak or no PR fits, return a single cause with prNumber null, confidence low, and explain why in reasoning.
+8. Return structured output only.`;
 }
 
 function createAnalysisMcpServer(ctx: FailureAnalysisContext, github: GitHubService) {
@@ -633,7 +672,7 @@ export async function runClaudeFailureAnalysis(
   github: GitHubService,
   ctx: FailureAnalysisContext,
   onProgress?: AnalysisProgressHandler,
-): Promise<Pick<WorkflowFailureAnalysis, 'summary' | 'likelyCause' | 'model'>> {
+): Promise<Pick<WorkflowFailureAnalysis, 'summary' | 'likelyCause' | 'likelyCauses' | 'model'>> {
   if (!isClaudeAgentConfigured()) {
     const err = new Error(
       'Claude Agent is not configured. Set ANTHROPIC_API_KEY, or configure apiKeyHelper (and related env) in ~/.claude/settings.json.',
@@ -724,23 +763,25 @@ export async function runClaudeFailureAnalysis(
     throw wrapped;
   }
 
-  const matchedPr =
-    structured.likelyPrNumber != null
-      ? ctx.associatedPrs.find((pr) => pr.number === structured!.likelyPrNumber)
-      : undefined;
-
-  const confidence = structured.confidence as WorkflowFailureConfidence;
+  const likelyCauses = structured.likelyCauses.map((cause) => {
+    const matchedPr =
+      cause.prNumber != null
+        ? ctx.associatedPrs.find((pr) => pr.number === cause.prNumber)
+        : undefined;
+    return {
+      prNumber: cause.prNumber,
+      prTitle: matchedPr?.title ?? null,
+      author: cause.author ?? matchedPr?.author ?? null,
+      confidence: cause.confidence as WorkflowFailureConfidence,
+      reasoning: cause.reasoning,
+    };
+  });
 
   return {
     summary: structured.summary,
     model,
-    likelyCause: {
-      prNumber: structured.likelyPrNumber,
-      prTitle: matchedPr?.title ?? null,
-      author: structured.likelyAuthor ?? matchedPr?.author ?? null,
-      confidence,
-      reasoning: structured.reasoning,
-    },
+    likelyCause: likelyCauses[0]!,
+    likelyCauses,
   };
 }
 
@@ -774,10 +815,10 @@ export async function analyzeWorkflowFailure(
         role: 'system',
         text: `Using cached analysis from ${stored.analyzedAt} (skipped Claude).`,
       });
-      const analysis: WorkflowFailureAnalysis = {
+      const analysis = normalizeFailureAnalysis({
         ...stored.analysis,
         analyzedAt: stored.analyzedAt,
-      };
+      });
       emit({ type: 'result', analysis });
       return analysis;
     }
@@ -815,6 +856,7 @@ export async function analyzeWorkflowFailure(
     failedStages: ctx.failedStages,
     summary: agent.summary,
     likelyCause: agent.likelyCause,
+    likelyCauses: agent.likelyCauses,
     model: agent.model,
     analyzedAt,
   };

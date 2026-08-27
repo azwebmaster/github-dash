@@ -140,6 +140,12 @@ function confidenceColor(
   return 'default';
 }
 
+/** Prefer `likelyCauses`; fall back to legacy single `likelyCause` from older cache entries. */
+function analysisLikelyCauses(analysis: WorkflowFailureAnalysis) {
+  if (analysis.likelyCauses?.length) return analysis.likelyCauses;
+  return analysis.likelyCause ? [analysis.likelyCause] : [];
+}
+
 type AnalysisLogEntry = {
   id: number;
   role: 'system' | 'assistant' | 'tool' | 'status';
@@ -465,34 +471,66 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
 
             <Paper variant="outlined" sx={{ p: 2, bgcolor: 'action.hover' }}>
               <Typography variant="overline" color="text.secondary">
-                Likely cause
+                Likely causes
               </Typography>
-              <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mt: 0.5 }}>
-                {analysis.likelyCause.prNumber != null ? (
-                  <Link
-                    component={RouterLink}
-                    to={`/prs/${analysis.likelyCause.prNumber}`}
-                    underline="hover"
-                    fontWeight={700}
-                  >
-                    #{analysis.likelyCause.prNumber}
-                    {analysis.likelyCause.prTitle ? ` · ${analysis.likelyCause.prTitle}` : ''}
-                  </Link>
+              <Stack spacing={1.25} sx={{ mt: 0.5 }}>
+                {analysisLikelyCauses(analysis).length === 0 ? (
+                  <Typography fontWeight={700}>No likely causes identified</Typography>
                 ) : (
-                  <Typography fontWeight={700}>No single PR identified</Typography>
+                  analysisLikelyCauses(analysis).map((cause, index) => (
+                    <Stack
+                      key={`${cause.prNumber ?? 'none'}-${index}`}
+                      spacing={0.5}
+                      sx={{
+                        pl: 1.5,
+                        borderLeft: 2,
+                        borderColor:
+                          index === 0 ? 'secondary.main' : 'divider',
+                      }}
+                    >
+                      <Stack
+                        direction="row"
+                        spacing={1}
+                        alignItems="center"
+                        flexWrap="wrap"
+                        useFlexGap
+                      >
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ fontFamily: '"IBM Plex Mono", monospace', minWidth: 1.5 }}
+                        >
+                          {index + 1}.
+                        </Typography>
+                        {cause.prNumber != null ? (
+                          <Link
+                            component={RouterLink}
+                            to={`/prs/${cause.prNumber}`}
+                            underline="hover"
+                            fontWeight={700}
+                          >
+                            #{cause.prNumber}
+                            {cause.prTitle ? ` · ${cause.prTitle}` : ''}
+                          </Link>
+                        ) : (
+                          <Typography fontWeight={700}>No single PR identified</Typography>
+                        )}
+                        {cause.author ? (
+                          <Chip size="small" label={`@${cause.author}`} color="secondary" />
+                        ) : null}
+                        <Chip
+                          size="small"
+                          label={`${cause.confidence} confidence`}
+                          color={confidenceColor(cause.confidence)}
+                        />
+                      </Stack>
+                      <Typography variant="body2" color="text.secondary">
+                        {cause.reasoning}
+                      </Typography>
+                    </Stack>
+                  ))
                 )}
-                {analysis.likelyCause.author ? (
-                  <Chip size="small" label={`@${analysis.likelyCause.author}`} color="secondary" />
-                ) : null}
-                <Chip
-                  size="small"
-                  label={`${analysis.likelyCause.confidence} confidence`}
-                  color={confidenceColor(analysis.likelyCause.confidence)}
-                />
               </Stack>
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                {analysis.likelyCause.reasoning}
-              </Typography>
             </Paper>
 
             <FailedStageTestChips analysis={analysis} />
@@ -503,18 +541,23 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
                   PRs from release notes
                 </Typography>
                 <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                  {analysis.associatedPrs.map((pr) => (
-                    <Chip
-                      key={pr.number}
-                      size="small"
-                      component={RouterLink}
-                      to={`/prs/${pr.number}`}
-                      clickable
-                      label={`#${pr.number}${pr.author ? ` @${pr.author}` : ''}`}
-                      color={pr.number === analysis.likelyCause.prNumber ? 'secondary' : 'default'}
-                      variant={pr.number === analysis.likelyCause.prNumber ? 'filled' : 'outlined'}
-                    />
-                  ))}
+                  {analysis.associatedPrs.map((pr) => {
+                    const implicated = analysisLikelyCauses(analysis).some(
+                      (cause) => cause.prNumber === pr.number,
+                    );
+                    return (
+                      <Chip
+                        key={pr.number}
+                        size="small"
+                        component={RouterLink}
+                        to={`/prs/${pr.number}`}
+                        clickable
+                        label={`#${pr.number}${pr.author ? ` @${pr.author}` : ''}`}
+                        color={implicated ? 'secondary' : 'default'}
+                        variant={implicated ? 'filled' : 'outlined'}
+                      />
+                    );
+                  })}
                 </Stack>
               </Stack>
             ) : null}

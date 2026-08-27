@@ -426,6 +426,15 @@ export type WorkflowFailureAnalysisEvent =
   | { type: 'result'; analysis: WorkflowFailureAnalysis }
   | { type: 'error'; message: string };
 
+/** One ranked suspect from Claude failure analysis. */
+export interface WorkflowFailureLikelyCause {
+  prNumber: number | null;
+  prTitle: string | null;
+  author: string | null;
+  confidence: WorkflowFailureConfidence;
+  reasoning: string;
+}
+
 /** Claude Agent SDK analysis of a failed workflow run. */
 export interface WorkflowFailureAnalysis {
   runId: number;
@@ -451,13 +460,10 @@ export interface WorkflowFailureAnalysis {
   }>;
   failedStages: WorkflowFailureStage[];
   summary: string;
-  likelyCause: {
-    prNumber: number | null;
-    prTitle: string | null;
-    author: string | null;
-    confidence: WorkflowFailureConfidence;
-    reasoning: string;
-  };
+  /** Primary (top-ranked) likely cause — same as `likelyCauses[0]` when present. */
+  likelyCause: WorkflowFailureLikelyCause;
+  /** Ranked likely causes (most likely first), each with its own reason. */
+  likelyCauses: WorkflowFailureLikelyCause[];
   model: string | null;
   /** ISO timestamp when this analysis was produced (set when cached). */
   analyzedAt?: string | null;

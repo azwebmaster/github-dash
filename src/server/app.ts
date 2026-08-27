@@ -287,10 +287,13 @@ export function createApp(options: CreateAppOptions): Express {
         res.status(404).json({ error: 'No cached analysis for this workflow run' });
         return;
       }
-      res.json({
-        ...stored.analysis,
-        analyzedAt: stored.analyzedAt,
-      });
+      const { normalizeFailureAnalysis } = await import('./github/failure-analysis.js');
+      res.json(
+        normalizeFailureAnalysis({
+          ...stored.analysis,
+          analyzedAt: stored.analyzedAt,
+        }),
+      );
     } catch (err) {
       next(err);
     }

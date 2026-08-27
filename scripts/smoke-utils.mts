@@ -418,6 +418,30 @@ on:
     [{ type: 'log', role: 'assistant', text: 'Checking failed tests…' }],
   );
 
+  const { normalizeFailureAnalysis } = await import('../src/server/github/failure-analysis.ts');
+  const legacyOnlyPrimary = normalizeFailureAnalysis({
+    runId: 1,
+    tagName: null,
+    release: null,
+    releaseNotesSource: 'none',
+    associatedPrs: [],
+    failedJobs: [],
+    failedStages: [],
+    summary: 'Failed',
+    likelyCause: {
+      prNumber: 3,
+      prTitle: 'Old',
+      author: 'dan',
+      confidence: 'medium',
+      reasoning: 'Legacy single cause',
+    },
+    likelyCauses: [],
+    model: null,
+  });
+  assert.equal(legacyOnlyPrimary.likelyCauses.length, 1);
+  assert.equal(legacyOnlyPrimary.likelyCauses[0].prNumber, 3);
+  assert.equal(legacyOnlyPrimary.likelyCause.prNumber, 3);
+
   const fingerprintCtx = {
     run: {
       id: 99,
@@ -493,6 +517,22 @@ on:
       confidence: 'high' as const,
       reasoning: 'Matched failing suite names',
     },
+    likelyCauses: [
+      {
+        prNumber: 7,
+        prTitle: 'Break tests',
+        author: 'bob',
+        confidence: 'high' as const,
+        reasoning: 'Matched failing suite names',
+      },
+      {
+        prNumber: 9,
+        prTitle: 'Flaky checkout',
+        author: 'cara',
+        confidence: 'medium' as const,
+        reasoning: 'Touches shared checkout helpers used by the failing suite',
+      },
+    ],
     model: 'claude-sonnet',
     analyzedAt: '2026-08-27T12:00:00.000Z',
   };
@@ -590,6 +630,15 @@ on:
         confidence: 'low' as const,
         reasoning: 'From cache',
       },
+      likelyCauses: [
+        {
+          prNumber: null,
+          prTitle: null,
+          author: null,
+          confidence: 'low' as const,
+          reasoning: 'From cache',
+        },
+      ],
       model: 'cached-model',
       analyzedAt: '2026-08-27T15:00:00.000Z',
     };
