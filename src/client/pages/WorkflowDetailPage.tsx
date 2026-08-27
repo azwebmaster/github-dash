@@ -1,7 +1,9 @@
 import { useState } from 'react';
 import {
+  Alert,
   Button,
   Chip,
+  CircularProgress,
   Link,
   Paper,
   Stack,
@@ -13,6 +15,7 @@ import {
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import TimerIcon from '@mui/icons-material/Timer';
+import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
 import { Link as RouterLink, useParams } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAsyncData } from '../hooks/useAsyncData';
@@ -26,7 +29,7 @@ import {
   findLongestStep,
 } from '../components/WorkflowJobsPanel';
 import { formatDurationSeconds } from '../../shared/utils';
-import type { WorkflowRunDetail } from '../../shared/types';
+import type { WorkflowFailureAnalysis, WorkflowRunDetail } from '../../shared/types';
 
 type Job = WorkflowRunDetail['jobs'][number];
 
@@ -124,6 +127,167 @@ function LongestHighlights({
   );
 }
 
+function confidenceColor(
+  confidence: WorkflowFailureAnalysis['likelyCause']['confidence'],
+): 'success' | 'warning' | 'default' {
+  if (confidence === 'high') return 'success';
+  if (confidence === 'medium') return 'warning';
+  return 'default';
+}
+
+function FailureAnalysisPanel({ runId }: { runId: number }) {
+  const { data: meta } = useAsyncData(() => api.meta(), []);
+  const [analysis, setAnalysis] = useState<WorkflowFailureAnalysis | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const runAnalysis = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await api.analyzeWorkflow(runId);
+      setAnalysis(result);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Paper
+      sx={{
+        p: 2.5,
+        borderLeft: 4,
+        borderColor: 'secondary.main',
+        bgcolor: 'background.paper',
+      }}
+    >
+      <Stack spacing={2}>
+        <Stack
+          direction="row"
+          spacing={1}
+          alignItems="center"
+          justifyContent="space-between"
+          flexWrap="wrap"
+          useFlexGap
+        >
+          <Stack spacing={0.5}>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <AutoAwesomeIcon color="secondary" fontSize="small" />
+              <Typography variant="h6">Claude failure analysis</Typography>
+            </Stack>
+            <Typography variant="body2" color="text.secondary">
+              Uses release notes linked to this run’s tag to identify the likely PR and author.
+            </Typography>
+          </Stack>
+          <Button
+            variant="contained"
+            color="secondary"
+            startIcon={loading ? <CircularProgress size={16} color="inherit" /> : <AutoAwesomeIcon />}
+            onClick={() => void runAnalysis()}
+            disabled={loading || meta?.claudeAnalysisAvailable === false}
+          >
+            {loading ? 'Analyzing…' : analysis ? 'Re-analyze' : 'Analyze failure'}
+          </Button>
+        </Stack>
+
+        {meta?.claudeAnalysisAvailable === false ? (
+          <Alert severity="warning">
+            Set <code>ANTHROPIC_API_KEY</code> on the server to enable Claude Agent analysis.
+          </Alert>
+        ) : null}
+
+        {error ? <Alert severity="error">{error}</Alert> : null}
+
+        {analysis ? (
+          <Stack spacing={1.5}>
+            <Typography>{analysis.summary}</Typography>
+
+            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+              {analysis.tagName ? (
+                <Chip size="small" label={`tag ${analysis.tagName}`} variant="outlined" />
+              ) : null}
+              <Chip
+                size="small"
+                label={`notes: ${analysis.releaseNotesSource}`}
+                variant="outlined"
+              />
+              {analysis.model ? (
+                <Chip
+                  size="small"
+                  label={analysis.model}
+                  variant="outlined"
+                  sx={{ fontFamily: '"IBM Plex Mono", monospace' }}
+                />
+              ) : null}
+              {analysis.release ? (
+                <Link href={analysis.release.htmlUrl} target="_blank" rel="noreferrer" variant="body2">
+                  {analysis.release.name}
+                </Link>
+              ) : null}
+            </Stack>
+
+            <Paper variant="outlined" sx={{ p: 2, bgcolor: 'action.hover' }}>
+              <Typography variant="overline" color="text.secondary">
+                Likely cause
+              </Typography>
+              <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mt: 0.5 }}>
+                {analysis.likelyCause.prNumber != null ? (
+                  <Link
+                    component={RouterLink}
+                    to={`/prs/${analysis.likelyCause.prNumber}`}
+                    underline="hover"
+                    fontWeight={700}
+                  >
+                    #{analysis.likelyCause.prNumber}
+                    {analysis.likelyCause.prTitle ? ` · ${analysis.likelyCause.prTitle}` : ''}
+                  </Link>
+                ) : (
+                  <Typography fontWeight={700}>No single PR identified</Typography>
+                )}
+                {analysis.likelyCause.author ? (
+                  <Chip size="small" label={`@${analysis.likelyCause.author}`} color="secondary" />
+                ) : null}
+                <Chip
+                  size="small"
+                  label={`${analysis.likelyCause.confidence} confidence`}
+                  color={confidenceColor(analysis.likelyCause.confidence)}
+                />
+              </Stack>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                {analysis.likelyCause.reasoning}
+              </Typography>
+            </Paper>
+
+            {analysis.associatedPrs.length > 0 ? (
+              <Stack spacing={0.75}>
+                <Typography variant="caption" color="text.secondary">
+                  PRs from release notes
+                </Typography>
+                <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                  {analysis.associatedPrs.map((pr) => (
+                    <Chip
+                      key={pr.number}
+                      size="small"
+                      component={RouterLink}
+                      to={`/prs/${pr.number}`}
+                      clickable
+                      label={`#${pr.number}${pr.author ? ` @${pr.author}` : ''}`}
+                      color={pr.number === analysis.likelyCause.prNumber ? 'secondary' : 'default'}
+                      variant={pr.number === analysis.likelyCause.prNumber ? 'filled' : 'outlined'}
+                    />
+                  ))}
+                </Stack>
+              </Stack>
+            ) : null}
+          </Stack>
+        ) : null}
+      </Stack>
+    </Paper>
+  );
+}
+
 export default function WorkflowDetailPage() {
   const { id } = useParams();
   const runId = Number(id);
@@ -137,6 +301,12 @@ export default function WorkflowDetailPage() {
   const backTo = data.workflowId
     ? `/workflows/by/${data.workflowId}`
     : '/workflows';
+
+  const showAnalysis =
+    data.conclusion === 'failure' ||
+    data.conclusion === 'timed_out' ||
+    data.conclusion === 'startup_failure' ||
+    Boolean(data.orchestration?.pipeline.stages.some((s) => s.State === 4));
 
   const jobsTab = (
     <Stack spacing={3}>
@@ -189,6 +359,8 @@ export default function WorkflowDetailPage() {
           <StatTile label="Updated" value={formatDate(data.updatedAt)} />
         </Grid>
       </Grid>
+
+      {showAnalysis ? <FailureAnalysisPanel runId={data.id} /> : null}
 
       {hasOrchestration && data.orchestration ? (
         <>

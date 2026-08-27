@@ -377,6 +377,50 @@ export interface WorkflowRunDetail extends WorkflowRunSummary {
   orchestrationArtifact: { id: number; name: string } | null;
 }
 
+/** Where release notes for a failure analysis came from. */
+export type WorkflowFailureNotesSource = 'orchestration' | 'github_release' | 'none';
+
+export type WorkflowFailureConfidence = 'high' | 'medium' | 'low';
+
+/** Claude Agent SDK analysis of a failed workflow run. */
+export interface WorkflowFailureAnalysis {
+  runId: number;
+  tagName: string | null;
+  release: {
+    id: number;
+    tagName: string;
+    name: string;
+    htmlUrl: string;
+  } | null;
+  releaseNotesSource: WorkflowFailureNotesSource;
+  associatedPrs: Array<{
+    number: number;
+    title: string | null;
+    author: string | null;
+    htmlUrl: string | null;
+    mergedAt: string | null;
+  }>;
+  failedJobs: Array<{
+    name: string;
+    conclusion: string | null;
+    failedSteps: string[];
+  }>;
+  failedStages: Array<{
+    id: string;
+    name: string;
+    error: string;
+  }>;
+  summary: string;
+  likelyCause: {
+    prNumber: number | null;
+    prTitle: string | null;
+    author: string | null;
+    confidence: WorkflowFailureConfidence;
+    reasoning: string;
+  };
+  model: string | null;
+}
+
 export interface WorkflowStats {
   totalRuns: number;
   success: number;

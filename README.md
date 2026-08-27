@@ -66,6 +66,7 @@ Vite serves the UI on `:5173` and proxies `/api` to the Express server on `:3847
 - **Commits** — recent history, verification, author stats, file-level drill-down
 - **Releases** — publish cadence timing; release notes parsed for `#123` / PR URLs; associated PRs listed on the detail page; creating-run stats from the configured release workflow (default `release.yml`), matched by release tag; cached release-train / orchestration stage health
 - **Workflows** — Actions success rate and duration stats with per-workflow flake streaks, conclusion strips, and duration sparklines; pin summary cards; click a workflow to see its past 100 runs, then open a run for job/step timings with longest job and step highlighted
+- **Failure analysis** — on failed runs, **Analyze failure** uses the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) with release notes linked to the run’s tag (orchestration notes or GitHub Release) to suggest the likely PR and author (`ANTHROPIC_API_KEY` required)
 
 GitHub responses are cached in-memory (`CACHE_TTL_MS`, default 5 minutes). Overview and orchestration health are warmed on server start.
 
@@ -85,4 +86,5 @@ GitHub responses are cached in-memory (`CACHE_TTL_MS`, default 5 minutes). Overv
 | `GET /api/workflows` | Workflow runs + metrics (includes per-workflow ids for drill-down) |
 | `GET /api/workflows/by/:workflowId` | Past 100 runs for a selected workflow |
 | `GET /api/workflows/:id` | Run detail with jobs/steps and durations |
+| `POST /api/workflows/:id/analyze` | Claude Agent SDK failure analysis (tag → release notes → likely PR/author) |
 | `GET /api/orchestration/health` | Cached release-workflow orchestration stage rollups |

@@ -97,8 +97,59 @@ export function normalizeReleaseWorkflowFile(value: string | null | undefined): 
     .replace(/^workflows\//i, '');
 }
 
-function normalizeTagRef(value: string): string {
-  return value.replace(/^refs\/tags\//, '');
+export function normalizeTagRef(value: string): string {
+  return value.replace(/^refs\/tags\//, '').trim();
+}
+
+/**
+ * Heuristic: treat a ref as a release tag when it is not a typical branch name
+ * (main/master/develop/…, or a long commit SHA).
+ */
+export function looksLikeReleaseTag(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const tag = normalizeTagRef(value);
+  if (!tag) return false;
+  if (looksLikeCommitSha(tag) && tag.length >= 40) return false;
+  if (/^(main|master|develop|development|trunk|head|gh-pages)$/i.test(tag)) return false;
+  if (/^(feature|bugfix|hotfix|release|chore|docs|ci|test|refactor)\//i.test(tag)) return false;
+  // Prefer version-ish / dated tags, or refs that already look like tags (v1.2.3, 2026.08.06.1).
+  if (/^v?\d+(\.\d+)+/i.test(tag)) return true;
+  if (/^\d{4}[.\-_]\d{2}[.\-_]\d{2}/.test(tag)) return true;
+  // Tag-triggered release trains often use the tag as head_branch.
+  if (!tag.includes('/') && /[0-9]/.test(tag)) return true;
+  return false;
+}
+
+/**
+ * Resolve the release tag associated with a workflow run.
+ * Prefers orchestration.branch, then a tag-like head_branch, then release_notes_url path.
+ */
+export function resolveWorkflowRunTag(input: {
+  branch?: string | null;
+  orchestrationBranch?: string | null;
+  releaseNotesUrl?: string | null;
+}): string | null {
+  const candidates = [input.orchestrationBranch, input.branch]
+    .map((v) => (v ? normalizeTagRef(v) : ''))
+    .filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (looksLikeReleaseTag(candidate)) return candidate;
+  }
+
+  const url = input.releaseNotesUrl?.trim();
+  if (url) {
+    const tagMatch = url.match(/\/(?:releases\/tag|tags)\/([^/?#]+)/i);
+    if (tagMatch?.[1]) {
+      try {
+        return normalizeTagRef(decodeURIComponent(tagMatch[1]));
+      } catch {
+        return normalizeTagRef(tagMatch[1]);
+      }
+    }
+  }
+
+  return candidates[0] || null;
 }
 
 /** True when a GitHub `target_commitish` looks like a commit SHA rather than a branch name. */
