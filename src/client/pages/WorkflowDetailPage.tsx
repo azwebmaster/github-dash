@@ -189,12 +189,15 @@ function AnalysisProgressLog({
   loading: boolean;
 }) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
-  const [expanded, setExpanded] = useState(loading);
+  /** User can re-open the log after completion; reset whenever a new run starts. */
+  const [userOpen, setUserOpen] = useState(false);
 
   useEffect(() => {
-    if (loading) setExpanded(true);
-    else setExpanded(false);
+    if (loading) setUserOpen(false);
   }, [loading]);
+
+  // Expanded while analyzing; collapsed when finished unless the user re-opens it.
+  const expanded = loading || userOpen;
 
   useEffect(() => {
     const el = scrollerRef.current;
@@ -209,7 +212,10 @@ function AnalysisProgressLog({
       disableGutters
       elevation={0}
       expanded={expanded}
-      onChange={(_event, next) => setExpanded(next)}
+      onChange={(_event, next) => {
+        if (loading) return;
+        setUserOpen(next);
+      }}
       sx={{
         border: 1,
         borderColor: 'divider',
