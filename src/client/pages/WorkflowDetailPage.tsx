@@ -375,7 +375,7 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
             color="secondary"
             startIcon={loading ? <CircularProgress size={16} color="inherit" /> : <AutoAwesomeIcon />}
             onClick={() => void runAnalysis()}
-            disabled={loading || meta?.claudeAnalysisAvailable === false}
+            disabled={loading}
           >
             {loading ? 'Analyzing…' : analysis ? 'Re-analyze' : 'Analyze failure'}
           </Button>
