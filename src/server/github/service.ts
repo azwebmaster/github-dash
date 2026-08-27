@@ -59,6 +59,17 @@ const ORCHESTRATION_HEALTH_CONCURRENCY = 3;
 const ORCH_STAGE_SUCCESS = 3;
 const ORCH_STAGE_FAILURE = 4;
 
+/** Keep job logs bounded for Claude context / cache payloads. */
+export function truncateWorkflowJobLog(raw: string, maxChars = 14_000): string {
+  const normalized = raw.replace(/\r\n/g, '\n').trimEnd();
+  if (normalized.length <= maxChars) return normalized;
+  const tail = normalized.slice(-maxChars);
+  const firstNewline = tail.indexOf('\n');
+  const trimmed = firstNewline >= 0 && firstNewline < 200 ? tail.slice(firstNewline + 1) : tail;
+  const omitted = normalized.length - trimmed.length;
+  return `…(truncated ${omitted} chars from start)…\n${trimmed}`;
+}
+
 function conclusionKind(conclusion: string | null): WorkflowConclusionKind {
   if (conclusion === 'success') return 'success';
   if (conclusion === 'failure' || conclusion === 'timed_out' || conclusion === 'startup_failure') {
@@ -226,6 +237,56 @@ export class GitHubService {
     await this.cache.delete(this.failureAnalysisCacheKey(runId));
     if (this.cacheDebugEnabled()) {
       console.log(`[cache] DEL  ${this.failureAnalysisCacheKey(runId)}`);
+    }
+  }
+
+  /**
+   * Download plain-text logs for a workflow job via the Actions API
+   * (`GET .../actions/jobs/{job_id}/logs`, which 302s to a short-lived URL).
+   * Returns truncated text, or null when logs are missing/expired/inaccessible.
+   */
+  async downloadJobLogText(
+    jobId: number,
+    options?: { owner?: string; repo?: string; maxChars?: number },
+  ): Promise<string | null> {
+    const owner = options?.owner?.trim() || this.ref.owner;
+    const repo = options?.repo?.trim() || this.ref.repo;
+    const maxChars = options?.maxChars ?? 14_000;
+
+    try {
+      const response = await this.octokit.actions.downloadJobLogsForWorkflowRun({
+        owner,
+        repo,
+        job_id: jobId,
+        request: {
+          redirect: 'manual',
+          parseSuccessResponseBody: false,
+        },
+      });
+
+      const location =
+        (typeof response.headers.location === 'string' && response.headers.location) || null;
+
+      let raw = '';
+      if (location) {
+        const logRes = await fetch(location);
+        if (!logRes.ok) return null;
+        raw = await logRes.text();
+      } else {
+        const data = response.data as unknown;
+        if (typeof data === 'string') raw = data;
+        else if (data instanceof ArrayBuffer) raw = new TextDecoder().decode(data);
+        else if (data instanceof Uint8Array) raw = new TextDecoder().decode(data);
+        else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(data)) {
+          raw = data.toString('utf8');
+        } else {
+          return null;
+        }
+      }
+
+      return truncateWorkflowJobLog(raw, maxChars);
+    } catch {
+      return null;
     }
   }
 

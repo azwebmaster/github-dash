@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
   Alert,
   Box,
   Button,
@@ -14,6 +17,7 @@ import {
   Grid,
 } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import TimerIcon from '@mui/icons-material/Timer';
 import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
@@ -33,6 +37,8 @@ import { formatDurationSeconds } from '../../shared/utils';
 import type {
   WorkflowFailureAnalysis,
   WorkflowFailureAnalysisEvent,
+  WorkflowFailureLikelyCause,
+  WorkflowFailureTargetAnalysis,
   WorkflowRunDetail,
 } from '../../shared/types';
 
@@ -133,7 +139,7 @@ function LongestHighlights({
 }
 
 function confidenceColor(
-  confidence: WorkflowFailureAnalysis['likelyCause']['confidence'],
+  confidence: WorkflowFailureLikelyCause['confidence'],
 ): 'success' | 'warning' | 'default' {
   if (confidence === 'high') return 'success';
   if (confidence === 'medium') return 'warning';
@@ -141,9 +147,16 @@ function confidenceColor(
 }
 
 /** Prefer `likelyCauses`; fall back to legacy single `likelyCause` from older cache entries. */
-function analysisLikelyCauses(analysis: WorkflowFailureAnalysis) {
+function analysisLikelyCauses(
+  analysis: Pick<WorkflowFailureAnalysis, 'likelyCauses' | 'likelyCause'>,
+) {
   if (analysis.likelyCauses?.length) return analysis.likelyCauses;
   return analysis.likelyCause ? [analysis.likelyCause] : [];
+}
+
+function analysisByFailure(analysis: WorkflowFailureAnalysis): WorkflowFailureTargetAnalysis[] {
+  if (analysis.byFailure?.length) return analysis.byFailure;
+  return [];
 }
 
 type AnalysisLogEntry = {
@@ -176,98 +189,252 @@ function AnalysisProgressLog({
   loading: boolean;
 }) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const [expanded, setExpanded] = useState(loading);
+
+  useEffect(() => {
+    if (loading) setExpanded(true);
+    else setExpanded(false);
+  }, [loading]);
 
   useEffect(() => {
     const el = scrollerRef.current;
-    if (!el) return;
+    if (!el || !expanded) return;
     el.scrollTop = el.scrollHeight;
-  }, [entries, status]);
+  }, [entries, status, expanded]);
 
   if (!loading && entries.length === 0) return null;
 
   return (
-    <Paper
-      variant="outlined"
+    <Accordion
+      disableGutters
+      elevation={0}
+      expanded={expanded}
+      onChange={(_event, next) => setExpanded(next)}
       sx={{
-        p: 0,
-        overflow: 'hidden',
+        border: 1,
+        borderColor: 'divider',
         bgcolor: 'rgba(15, 76, 92, 0.03)',
+        '&:before': { display: 'none' },
       }}
     >
-      <Stack
-        direction="row"
-        spacing={1}
-        alignItems="center"
-        sx={{ px: 1.5, py: 1, borderBottom: 1, borderColor: 'divider' }}
-      >
-        {loading ? <CircularProgress size={14} /> : null}
-        <Typography variant="caption" color="text.secondary">
-          {loading ? status || 'Analyzing…' : 'Analysis log'}
-        </Typography>
-      </Stack>
-      <Box
-        ref={scrollerRef}
-        sx={{
-          maxHeight: 260,
-          overflow: 'auto',
-          px: 1.5,
-          py: 1,
-          fontFamily: '"IBM Plex Mono", monospace',
-        }}
-      >
-        <Stack spacing={1}>
-          {entries.map((entry) => (
-            <Box key={entry.id}>
-              <Typography
-                variant="caption"
-                sx={{ color: logRoleColor(entry.role), fontWeight: 700, display: 'right' }}
-              >
-                {logRoleLabel(entry.role)}
-              </Typography>
-              <Typography
-                variant="body2"
-                sx={{
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-word',
-                  color: entry.role === 'status' ? 'text.secondary' : 'text.primary',
-                }}
-              >
-                {entry.text}
-              </Typography>
-            </Box>
-          ))}
-          {loading && entries.length === 0 ? (
-            <Typography variant="body2" color="text.secondary">
-              Waiting for agent events…
-            </Typography>
-          ) : null}
+      <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+        <Stack direction="row" spacing={1} alignItems="center">
+          {loading ? <CircularProgress size={14} /> : null}
+          <Typography variant="caption" color="text.secondary">
+            {loading
+              ? status || 'Analyzing…'
+              : `Analysis log · ${entries.length} event${entries.length === 1 ? '' : 's'}`}
+          </Typography>
         </Stack>
-      </Box>
-    </Paper>
+      </AccordionSummary>
+      <AccordionDetails sx={{ pt: 0 }}>
+        <Box
+          ref={scrollerRef}
+          sx={{
+            maxHeight: 260,
+            overflow: 'auto',
+            px: 0.5,
+            py: 1,
+            fontFamily: '"IBM Plex Mono", monospace',
+          }}
+        >
+          <Stack spacing={1}>
+            {entries.map((entry) => (
+              <Box key={entry.id}>
+                <Typography
+                  variant="caption"
+                  sx={{ color: logRoleColor(entry.role), fontWeight: 700, mr: 1 }}
+                >
+                  {logRoleLabel(entry.role)}
+                </Typography>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    color: entry.role === 'status' ? 'text.secondary' : 'text.primary',
+                  }}
+                >
+                  {entry.text}
+                </Typography>
+              </Box>
+            ))}
+            {loading && entries.length === 0 ? (
+              <Typography variant="body2" color="text.secondary">
+                Waiting for agent events…
+              </Typography>
+            ) : null}
+          </Stack>
+        </Box>
+      </AccordionDetails>
+    </Accordion>
+  );
+}
+
+function LikelyCauseList({ causes }: { causes: WorkflowFailureLikelyCause[] }) {
+  if (causes.length === 0) {
+    return <Typography fontWeight={700}>No likely causes identified</Typography>;
+  }
+  return (
+    <Stack spacing={1.25}>
+      {causes.map((cause, index) => (
+        <Stack
+          key={`${cause.prNumber ?? 'none'}-${index}`}
+          spacing={0.5}
+          sx={{
+            pl: 1.5,
+            borderLeft: 2,
+            borderColor: index === 0 ? 'secondary.main' : 'divider',
+          }}
+        >
+          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ fontFamily: '"IBM Plex Mono", monospace', minWidth: 1.5 }}
+            >
+              {index + 1}.
+            </Typography>
+            {cause.prNumber != null ? (
+              <Link
+                component={RouterLink}
+                to={`/prs/${cause.prNumber}`}
+                underline="hover"
+                fontWeight={700}
+              >
+                #{cause.prNumber}
+                {cause.prTitle ? ` · ${cause.prTitle}` : ''}
+              </Link>
+            ) : (
+              <Typography fontWeight={700}>No single PR identified</Typography>
+            )}
+            {cause.author ? (
+              <Chip size="small" label={`@${cause.author}`} color="secondary" />
+            ) : null}
+            <Chip
+              size="small"
+              label={`${cause.confidence} confidence`}
+              color={confidenceColor(cause.confidence)}
+            />
+          </Stack>
+          <Typography variant="body2" color="text.secondary">
+            {cause.reasoning}
+          </Typography>
+        </Stack>
+      ))}
+    </Stack>
+  );
+}
+
+function ByFailureGroups({ analysis }: { analysis: WorkflowFailureAnalysis }) {
+  const entries = analysisByFailure(analysis);
+  if (entries.length === 0) return null;
+
+  const jobs = entries.filter((e) => e.kind === 'job');
+  const stages = entries.filter((e) => e.kind === 'stage');
+
+  const renderGroup = (title: string, items: WorkflowFailureTargetAnalysis[]) => {
+    if (items.length === 0) return null;
+    return (
+      <Stack spacing={1}>
+        <Typography variant="overline" color="text.secondary">
+          {title}
+        </Typography>
+        {items.map((entry) => (
+          <Accordion
+            key={`${entry.kind}-${entry.targetId}`}
+            disableGutters
+            defaultExpanded
+            elevation={0}
+            sx={{ border: 1, borderColor: 'divider', '&:before': { display: 'none' } }}
+          >
+            <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+              <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                <Chip
+                  size="small"
+                  label={entry.kind}
+                  color={entry.kind === 'stage' ? 'warning' : 'default'}
+                  variant="outlined"
+                />
+                <Typography fontWeight={700}>{entry.targetName}</Typography>
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ fontFamily: '"IBM Plex Mono", monospace' }}
+                >
+                  {entry.targetId}
+                </Typography>
+              </Stack>
+            </AccordionSummary>
+            <AccordionDetails>
+              <Stack spacing={1.25}>
+                <Typography variant="body2">{entry.summary}</Typography>
+                <LikelyCauseList causes={entry.likelyCauses} />
+              </Stack>
+            </AccordionDetails>
+          </Accordion>
+        ))}
+      </Stack>
+    );
+  };
+
+  return (
+    <Stack spacing={2}>
+      {renderGroup(`Failed jobs (${jobs.length})`, jobs)}
+      {renderGroup(`Failed stages (${stages.length})`, stages)}
+    </Stack>
   );
 }
 
 function FailedStageTestChips({ analysis }: { analysis: WorkflowFailureAnalysis }) {
   const withTests = analysis.failedStages.filter((s) => s.testReport);
-  if (withTests.length === 0) return null;
+  const withLogs = [
+    ...analysis.failedJobs.filter((j) => j.logsFetched),
+    ...analysis.failedStages.flatMap((s) => s.linkedFailedJobs ?? []).filter((j) => j.logsFetched),
+  ];
+  if (withTests.length === 0 && withLogs.length === 0) return null;
 
   return (
     <Stack spacing={0.75}>
-      <Typography variant="caption" color="text.secondary">
-        Stage test reports used in analysis
-      </Typography>
-      <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-        {withTests.map((stage) => {
-          const failedTests =
-            stage.testReport?.suites.reduce((n, s) => n + s.failedTests.length, 0) ?? 0;
-          const label = stage.testReport?.infraFailure
-            ? `${stage.name}: infra failure`
-            : failedTests > 0
-              ? `${stage.name}: ${failedTests} failed test${failedTests === 1 ? '' : 's'}`
-              : `${stage.name}: ${stage.testReport?.overall || 'tests'}`;
-          return <Chip key={stage.id} size="small" label={label} variant="outlined" color="error" />;
-        })}
-      </Stack>
+      {withTests.length > 0 ? (
+        <>
+          <Typography variant="caption" color="text.secondary">
+            Stage test reports used in analysis
+          </Typography>
+          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+            {withTests.map((stage) => {
+              const failedTests =
+                stage.testReport?.suites.reduce((n, s) => n + s.failedTests.length, 0) ?? 0;
+              const label = stage.testReport?.infraFailure
+                ? `${stage.name}: infra failure`
+                : failedTests > 0
+                  ? `${stage.name}: ${failedTests} failed test${failedTests === 1 ? '' : 's'}`
+                  : `${stage.name}: ${stage.testReport?.overall || 'tests'}`;
+              return (
+                <Chip key={stage.id} size="small" label={label} variant="outlined" color="error" />
+              );
+            })}
+          </Stack>
+        </>
+      ) : null}
+      {withLogs.length > 0 ? (
+        <>
+          <Typography variant="caption" color="text.secondary">
+            GitHub job logs used in analysis
+          </Typography>
+          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+            {withLogs.map((job) => (
+              <Chip
+                key={`${job.id}-${job.name}`}
+                size="small"
+                label={`${job.name}${job.logExcerpt ? '' : ' (unavailable)'}`}
+                variant="outlined"
+                color={job.logExcerpt ? 'info' : 'default'}
+              />
+            ))}
+          </Stack>
+        </>
+      ) : null}
     </Stack>
   );
 }
@@ -407,8 +574,8 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
               <Typography variant="h6">Claude failure analysis</Typography>
             </Stack>
             <Typography variant="body2" color="text.secondary">
-              Uses release notes and orchestration stage test reports to identify the likely PR and
-              author. Results are cached so revisiting a run does not re-run Claude.
+              Groups analysis by each failed job and orchestration stage, using GitHub job logs,
+              release notes, and stage test reports. Results are cached per run.
             </Typography>
           </Stack>
           <Button
@@ -469,67 +636,14 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
               ) : null}
             </Stack>
 
+            <ByFailureGroups analysis={analysis} />
+
             <Paper variant="outlined" sx={{ p: 2, bgcolor: 'action.hover' }}>
               <Typography variant="overline" color="text.secondary">
-                Likely causes
+                Overall likely causes
               </Typography>
               <Stack spacing={1.25} sx={{ mt: 0.5 }}>
-                {analysisLikelyCauses(analysis).length === 0 ? (
-                  <Typography fontWeight={700}>No likely causes identified</Typography>
-                ) : (
-                  analysisLikelyCauses(analysis).map((cause, index) => (
-                    <Stack
-                      key={`${cause.prNumber ?? 'none'}-${index}`}
-                      spacing={0.5}
-                      sx={{
-                        pl: 1.5,
-                        borderLeft: 2,
-                        borderColor:
-                          index === 0 ? 'secondary.main' : 'divider',
-                      }}
-                    >
-                      <Stack
-                        direction="row"
-                        spacing={1}
-                        alignItems="center"
-                        flexWrap="wrap"
-                        useFlexGap
-                      >
-                        <Typography
-                          variant="caption"
-                          color="text.secondary"
-                          sx={{ fontFamily: '"IBM Plex Mono", monospace', minWidth: 1.5 }}
-                        >
-                          {index + 1}.
-                        </Typography>
-                        {cause.prNumber != null ? (
-                          <Link
-                            component={RouterLink}
-                            to={`/prs/${cause.prNumber}`}
-                            underline="hover"
-                            fontWeight={700}
-                          >
-                            #{cause.prNumber}
-                            {cause.prTitle ? ` · ${cause.prTitle}` : ''}
-                          </Link>
-                        ) : (
-                          <Typography fontWeight={700}>No single PR identified</Typography>
-                        )}
-                        {cause.author ? (
-                          <Chip size="small" label={`@${cause.author}`} color="secondary" />
-                        ) : null}
-                        <Chip
-                          size="small"
-                          label={`${cause.confidence} confidence`}
-                          color={confidenceColor(cause.confidence)}
-                        />
-                      </Stack>
-                      <Typography variant="body2" color="text.secondary">
-                        {cause.reasoning}
-                      </Typography>
-                    </Stack>
-                  ))
-                )}
+                <LikelyCauseList causes={analysisLikelyCauses(analysis)} />
               </Stack>
             </Paper>
 
@@ -542,9 +656,11 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
                 </Typography>
                 <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
                   {analysis.associatedPrs.map((pr) => {
-                    const implicated = analysisLikelyCauses(analysis).some(
-                      (cause) => cause.prNumber === pr.number,
-                    );
+                    const implicated =
+                      analysisLikelyCauses(analysis).some((cause) => cause.prNumber === pr.number) ||
+                      analysisByFailure(analysis).some((entry) =>
+                        entry.likelyCauses.some((cause) => cause.prNumber === pr.number),
+                      );
                     return (
                       <Chip
                         key={pr.number}
