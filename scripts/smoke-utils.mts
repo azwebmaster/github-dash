@@ -368,7 +368,17 @@ on:
       orchestration: null,
       orchestrationArtifact: null,
     }),
-    [{ name: 'Test', conclusion: 'failure', failedSteps: ['Run suite'] }],
+    [
+      {
+        id: 11,
+        name: 'Test',
+        conclusion: 'failure',
+        failedSteps: ['Run suite'],
+        htmlUrl: '',
+        logExcerpt: null,
+        logsFetched: false,
+      },
+    ],
   );
 
   assert.deepEqual(
@@ -389,6 +399,11 @@ on:
         statusText: '',
         testSummary: true,
         testReport: null,
+        group: '',
+        runId: null,
+        runUrl: '',
+        repo: null,
+        linkedFailedJobs: [],
       },
     ],
   );
@@ -436,11 +451,71 @@ on:
       reasoning: 'Legacy single cause',
     },
     likelyCauses: [],
+    byFailure: [],
     model: null,
   });
   assert.equal(legacyOnlyPrimary.likelyCauses.length, 1);
   assert.equal(legacyOnlyPrimary.likelyCauses[0].prNumber, 3);
   assert.equal(legacyOnlyPrimary.likelyCause.prNumber, 3);
+  assert.equal(legacyOnlyPrimary.byFailure.length, 0);
+
+  const legacyWithJobs = normalizeFailureAnalysis({
+    runId: 2,
+    tagName: null,
+    release: null,
+    releaseNotesSource: 'none',
+    associatedPrs: [],
+    failedJobs: [
+      {
+        id: 5,
+        name: 'Build',
+        conclusion: 'failure',
+        failedSteps: ['Compile'],
+        htmlUrl: '',
+        logExcerpt: null,
+        logsFetched: false,
+      },
+    ],
+    failedStages: [
+      {
+        id: 'qa',
+        name: 'QA',
+        error: 'tests failed',
+        env: 'staging',
+        statusText: '',
+        testSummary: true,
+        testReport: null,
+        group: '',
+        runId: null,
+        runUrl: '',
+        repo: null,
+        linkedFailedJobs: [],
+      },
+    ],
+    summary: 'Failed',
+    likelyCause: {
+      prNumber: 3,
+      prTitle: 'Old',
+      author: 'dan',
+      confidence: 'medium',
+      reasoning: 'Legacy single cause',
+    },
+    likelyCauses: [],
+    byFailure: [],
+    model: null,
+  });
+  assert.equal(legacyWithJobs.byFailure.length, 2);
+  assert.equal(legacyWithJobs.byFailure[0].kind, 'job');
+  assert.equal(legacyWithJobs.byFailure[0].targetId, '5');
+  assert.equal(legacyWithJobs.byFailure[1].kind, 'stage');
+  assert.equal(legacyWithJobs.byFailure[1].targetId, 'qa');
+
+  const { truncateWorkflowJobLog } = await import('../src/server/github/service.ts');
+  assert.equal(truncateWorkflowJobLog('short'), 'short');
+  const longLog = `${'a'.repeat(100)}\n${'error: boom\n'.repeat(2000)}`;
+  const truncated = truncateWorkflowJobLog(longLog, 500);
+  assert.ok(truncated.includes('truncated'));
+  assert.ok(truncated.length <= 560);
 
   const fingerprintCtx = {
     run: {
@@ -453,6 +528,8 @@ on:
       branch: 'v1.0.0',
       headSha: 'deadbeef',
       htmlUrl: 'https://example.com',
+      owner: 'acme',
+      repo: 'app',
     },
     tagName: 'v1.0.0',
     releaseNotesSource: 'orchestration' as const,
@@ -468,7 +545,17 @@ on:
         mergedAt: '2026-08-01T00:00:00.000Z',
       },
     ],
-    failedJobs: [{ name: 'Test', conclusion: 'failure', failedSteps: ['Run suite'] }],
+    failedJobs: [
+      {
+        id: 11,
+        name: 'Test',
+        conclusion: 'failure',
+        failedSteps: ['Run suite'],
+        htmlUrl: '',
+        logExcerpt: null,
+        logsFetched: false,
+      },
+    ],
     failedStages: withTests,
   };
   const fp1 = failureAnalysisFingerprint(fingerprintCtx);
@@ -507,7 +594,17 @@ on:
     release: null,
     releaseNotesSource: 'none' as const,
     associatedPrs: [],
-    failedJobs: [{ name: 'Test', conclusion: 'failure', failedSteps: ['Run suite'] }],
+    failedJobs: [
+      {
+        id: 1,
+        name: 'Test',
+        conclusion: 'failure',
+        failedSteps: ['Run suite'],
+        htmlUrl: '',
+        logExcerpt: null,
+        logsFetched: false,
+      },
+    ],
     failedStages: [],
     summary: 'Tests failed in QA',
     likelyCause: {
@@ -531,6 +628,23 @@ on:
         author: 'cara',
         confidence: 'medium' as const,
         reasoning: 'Touches shared checkout helpers used by the failing suite',
+      },
+    ],
+    byFailure: [
+      {
+        kind: 'job' as const,
+        targetId: '1',
+        targetName: 'Test',
+        summary: 'Test job failed',
+        likelyCauses: [
+          {
+            prNumber: 7,
+            prTitle: 'Break tests',
+            author: 'bob',
+            confidence: 'high' as const,
+            reasoning: 'Matched failing suite names',
+          },
+        ],
       },
     ],
     model: 'claude-sonnet',
@@ -610,6 +724,7 @@ on:
   github.getWorkflowRun = (async () => mockRun) as typeof github.getWorkflowRun;
   github.findReleaseByTag = (async () => null) as typeof github.findReleaseByTag;
   github.getPullRequestSummaries = (async () => []) as typeof github.getPullRequestSummaries;
+  github.downloadJobLogText = (async () => '##[error] suite failed') as typeof github.downloadJobLogText;
 
   try {
     const ctx = await buildFailureAnalysisContext(github, mockRun);
@@ -637,6 +752,23 @@ on:
           author: null,
           confidence: 'low' as const,
           reasoning: 'From cache',
+        },
+      ],
+      byFailure: [
+        {
+          kind: 'job' as const,
+          targetId: '1',
+          targetName: 'Test',
+          summary: 'Cached job analysis',
+          likelyCauses: [
+            {
+              prNumber: null,
+              prTitle: null,
+              author: null,
+              confidence: 'low' as const,
+              reasoning: 'From cache',
+            },
+          ],
         },
       ],
       model: 'cached-model',

@@ -408,6 +408,19 @@ export interface WorkflowFailureTestReport {
   suites: WorkflowFailureTestSuite[];
 }
 
+/** Failed GitHub Actions job snapshot used in Claude failure analysis. */
+export interface WorkflowFailureJob {
+  id: number;
+  name: string;
+  conclusion: string | null;
+  failedSteps: string[];
+  htmlUrl: string;
+  /** Truncated GitHub job log text (null when unavailable). */
+  logExcerpt: string | null;
+  /** True when a GitHub job-log download was attempted. */
+  logsFetched: boolean;
+}
+
 export interface WorkflowFailureStage {
   id: string;
   name: string;
@@ -417,6 +430,15 @@ export interface WorkflowFailureStage {
   testSummary: boolean;
   /** Present when the stage carried a TestReport in state.json. */
   testReport: WorkflowFailureTestReport | null;
+  /** Orchestration Stage.Group when set. */
+  group: string;
+  /** Linked Actions run id from state.json (0/null when absent). */
+  runId: number | null;
+  runUrl: string;
+  /** `owner/repo` for the linked run when known. */
+  repo: string | null;
+  /** Failed jobs from the stage's linked workflow run (logs included when fetched). */
+  linkedFailedJobs: WorkflowFailureJob[];
 }
 
 /** Streaming progress / chat-log events while analysis runs. */
@@ -433,6 +455,16 @@ export interface WorkflowFailureLikelyCause {
   author: string | null;
   confidence: WorkflowFailureConfidence;
   reasoning: string;
+}
+
+/** Claude analysis scoped to one failed job or orchestration stage. */
+export interface WorkflowFailureTargetAnalysis {
+  kind: 'job' | 'stage';
+  /** Job id (decimal string) or orchestration stage id. */
+  targetId: string;
+  targetName: string;
+  summary: string;
+  likelyCauses: WorkflowFailureLikelyCause[];
 }
 
 /** Claude Agent SDK analysis of a failed workflow run. */
@@ -453,17 +485,18 @@ export interface WorkflowFailureAnalysis {
     htmlUrl: string | null;
     mergedAt: string | null;
   }>;
-  failedJobs: Array<{
-    name: string;
-    conclusion: string | null;
-    failedSteps: string[];
-  }>;
+  failedJobs: WorkflowFailureJob[];
   failedStages: WorkflowFailureStage[];
   summary: string;
   /** Primary (top-ranked) likely cause — same as `likelyCauses[0]` when present. */
   likelyCause: WorkflowFailureLikelyCause;
-  /** Ranked likely causes (most likely first), each with its own reason. */
+  /** Ranked likely causes across the whole run (most likely first). */
   likelyCauses: WorkflowFailureLikelyCause[];
+  /**
+   * Per-failure analyses — one entry for every failed job and every failed stage.
+   * Older cached entries may omit this; clients should fall back to `likelyCauses`.
+   */
+  byFailure: WorkflowFailureTargetAnalysis[];
   model: string | null;
   /** ISO timestamp when this analysis was produced (set when cached). */
   analyzedAt?: string | null;
