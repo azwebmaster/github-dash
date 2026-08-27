@@ -52,6 +52,9 @@ export function createApp(options: CreateAppOptions): Express {
       owner: options.owner,
       repo: options.repo,
       releaseWorkflowFile: github.releaseWorkflowFile,
+      claudeAnalysisAvailable: Boolean(
+        process.env.ANTHROPIC_API_KEY?.trim() || process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim(),
+      ),
     });
   });
 
@@ -218,6 +221,20 @@ export function createApp(options: CreateAppOptions): Express {
         return;
       }
       res.json(await github.getWorkflowRun(id, { includeOrchestration, owner, repo }));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/workflows/:id/analyze', async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id)) {
+        res.status(400).json({ error: 'Invalid workflow run id' });
+        return;
+      }
+      const { analyzeWorkflowFailure } = await import('./github/failure-analysis.js');
+      res.json(await analyzeWorkflowFailure(github, id));
     } catch (err) {
       next(err);
     }

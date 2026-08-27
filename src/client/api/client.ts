@@ -11,6 +11,7 @@ import type {
   ReleaseDetail,
   ReleaseStats,
   ReleaseSummary,
+  WorkflowFailureAnalysis,
   WorkflowLifecycleMap,
   WorkflowRunDetail,
   WorkflowRunSummary,
@@ -29,18 +30,22 @@ interface CacheEntry {
 const clientCache = new Map<string, CacheEntry>();
 const clientInflight = new Map<string, Promise<unknown>>();
 
-async function request<T>(path: string): Promise<T> {
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase();
+  const cacheable = method === 'GET';
   const now = Date.now();
-  const cached = clientCache.get(path);
-  if (cached && cached.expiresAt > now) {
-    return cached.value as T;
+  if (cacheable) {
+    const cached = clientCache.get(path);
+    if (cached && cached.expiresAt > now) {
+      return cached.value as T;
+    }
+
+    const pending = clientInflight.get(path);
+    if (pending) return pending as Promise<T>;
   }
 
-  const pending = clientInflight.get(path);
-  if (pending) return pending as Promise<T>;
-
   const promise = (async () => {
-    const res = await fetch(path);
+    const res = await fetch(path, init);
     if (!res.ok) {
       let message = res.statusText;
       try {
@@ -52,13 +57,15 @@ async function request<T>(path: string): Promise<T> {
       throw new Error(message || `Request failed (${res.status})`);
     }
     const value = (await res.json()) as T;
-    clientCache.set(path, { value, expiresAt: Date.now() + CLIENT_CACHE_TTL_MS });
+    if (cacheable) {
+      clientCache.set(path, { value, expiresAt: Date.now() + CLIENT_CACHE_TTL_MS });
+    }
     return value;
   })().finally(() => {
-    clientInflight.delete(path);
+    if (cacheable) clientInflight.delete(path);
   });
 
-  clientInflight.set(path, promise);
+  if (cacheable) clientInflight.set(path, promise);
   return promise;
 }
 
@@ -75,7 +82,13 @@ function limitQuery(limit: RunLimit): string {
 }
 
 export const api = {
-  meta: () => request<{ owner: string; repo: string; releaseWorkflowFile: string }>('/api/meta'),
+  meta: () =>
+    request<{
+      owner: string;
+      repo: string;
+      releaseWorkflowFile: string;
+      claudeAnalysisAvailable: boolean;
+    }>('/api/meta'),
   overview: (days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS) =>
     request<OverviewStats>(`/api/overview?${daysQuery(days)}`),
   prs: (days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS) =>
@@ -108,5 +121,7 @@ export const api = {
     const qs = params.toString();
     return request<WorkflowRunDetail>(`/api/workflows/${id}${qs ? `?${qs}` : ''}`);
   },
+  analyzeWorkflow: (id: number) =>
+    request<WorkflowFailureAnalysis>(`/api/workflows/${id}/analyze`, { method: 'POST' }),
   orchestrationHealth: () => request<OrchestrationHealthSummary>('/api/orchestration/health'),
 };

@@ -196,4 +196,155 @@ on:
   ]);
 }
 
+{
+  const {
+    looksLikeReleaseTag,
+    resolveWorkflowRunTag,
+    normalizeTagRef,
+  } = await import('../src/shared/utils.ts');
+
+  assert.equal(normalizeTagRef('refs/tags/v1.2.3'), 'v1.2.3');
+  assert.equal(looksLikeReleaseTag('v1.2.3'), true);
+  assert.equal(looksLikeReleaseTag('2026.08.06.1'), true);
+  assert.equal(looksLikeReleaseTag('main'), false);
+  assert.equal(looksLikeReleaseTag('feature/foo'), false);
+  assert.equal(
+    resolveWorkflowRunTag({
+      branch: 'main',
+      orchestrationBranch: 'v2026.08.06.1',
+    }),
+    'v2026.08.06.1',
+  );
+  assert.equal(
+    resolveWorkflowRunTag({
+      branch: 'main',
+      releaseNotesUrl: 'https://github.com/acme/app/releases/tag/v9.9.9',
+    }),
+    'v9.9.9',
+  );
+}
+
+{
+  const { extractFailedJobs, extractFailedStages } = await import(
+    '../src/server/github/failure-analysis.ts'
+  );
+  const runBase = {
+    id: 1,
+    name: 'Release',
+    workflowId: 2,
+    workflowName: 'Release',
+    status: 'completed' as const,
+    conclusion: 'failure' as const,
+    event: 'push',
+    branch: 'v1.0.0',
+    headSha: 'abc',
+    createdAt: '2026-08-01T00:00:00.000Z',
+    updatedAt: '2026-08-01T01:00:00.000Z',
+    runStartedAt: '2026-08-01T00:00:00.000Z',
+    durationSeconds: 3600,
+    htmlUrl: 'https://example.com',
+    attempt: 1,
+  };
+  const failedStage = {
+    Stage: {
+      ID: 'deploy',
+      Name: 'Deploy',
+      Group: '',
+      Type: 'workflow',
+      Repo: '',
+      Workflow: '',
+      Ref: '',
+      ActiveRunCheck: null,
+      ActiveRunFilter: '',
+      Advisory: false,
+      TestSummary: false,
+      HostPaas: false,
+      Inputs: null,
+      Outputs: null,
+      Matrix: null,
+      Items: null,
+      URL: '',
+      ExpectVersion: '',
+    },
+    Env: 'prod',
+    State: 4 as const,
+    RunURL: '',
+    RunID: 0,
+    StartTime: '',
+    EndTime: '',
+    Error: 'image pull failed',
+    Outputs: {},
+    DryRunCmd: '',
+    StatusText: '',
+    MatrixRuns: null,
+    TestReport: null,
+  };
+
+  assert.deepEqual(
+    extractFailedJobs({
+      ...runBase,
+      jobs: [
+        {
+          id: 10,
+          name: 'Build',
+          status: 'completed',
+          conclusion: 'success',
+          createdAt: null,
+          startedAt: null,
+          completedAt: null,
+          durationSeconds: null,
+          queueSeconds: null,
+          htmlUrl: '',
+          steps: [],
+        },
+        {
+          id: 11,
+          name: 'Test',
+          status: 'completed',
+          conclusion: 'failure',
+          createdAt: null,
+          startedAt: null,
+          completedAt: null,
+          durationSeconds: null,
+          queueSeconds: null,
+          htmlUrl: '',
+          steps: [
+            {
+              name: 'Checkout',
+              status: 'completed',
+              conclusion: 'success',
+              number: 1,
+              durationSeconds: 1,
+              htmlUrl: '',
+            },
+            {
+              name: 'Run suite',
+              status: 'completed',
+              conclusion: 'failure',
+              number: 2,
+              durationSeconds: 10,
+              htmlUrl: '',
+            },
+          ],
+        },
+      ],
+      orchestration: null,
+      orchestrationArtifact: null,
+    }),
+    [{ name: 'Test', conclusion: 'failure', failedSteps: ['Run suite'] }],
+  );
+
+  assert.deepEqual(
+    extractFailedStages({
+      ...runBase,
+      jobs: [],
+      orchestration: {
+        pipeline: { stages: [failedStage], values: {}, snapshot: {} },
+      },
+      orchestrationArtifact: null,
+    }),
+    [{ id: 'deploy', name: 'Deploy', error: 'image pull failed' }],
+  );
+}
+
 console.log('ok');

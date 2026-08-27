@@ -407,6 +407,102 @@ export class GitHubService {
     };
   }
 
+  /** Lightweight PR metadata for release-note association (batched, soft-fail). */
+  async getPullRequestSummaries(
+    numbers: number[],
+  ): Promise<
+    Array<{
+      number: number;
+      title: string | null;
+      author: string | null;
+      htmlUrl: string | null;
+      mergedAt: string | null;
+    }>
+  > {
+    const unique = [...new Set(numbers)].filter((n) => Number.isFinite(n) && n > 0).slice(0, 50);
+    return Promise.all(
+      unique.map(async (num) => {
+        try {
+          const { data: pr } = await this.octokit.pulls.get({
+            owner: this.ref.owner,
+            repo: this.ref.repo,
+            pull_number: num,
+          });
+          return {
+            number: pr.number,
+            title: pr.title,
+            htmlUrl: pr.html_url,
+            mergedAt: pr.merged_at,
+            author: pr.user?.login ?? null,
+          };
+        } catch {
+          return {
+            number: num,
+            title: null,
+            htmlUrl: null,
+            mergedAt: null,
+            author: null,
+          };
+        }
+      }),
+    );
+  }
+
+  /** Resolve a GitHub Release by tag name (e.g. workflow head_branch / orchestration.branch). */
+  async findReleaseByTag(tagName: string): Promise<ReleaseDetail | null> {
+    const tag = tagName.replace(/^refs\/tags\//, '').trim();
+    if (!tag) return null;
+    return this.cached(this.cacheKey('release-by-tag', tag, this.releaseWorkflowFile), async () => {
+      try {
+        const { data: rel } = await this.octokit.repos.getReleaseByTag({
+          owner: this.ref.owner,
+          repo: this.ref.repo,
+          tag,
+        });
+        return await this.getRelease(rel.id);
+      } catch (err) {
+        const status =
+          typeof err === 'object' && err && 'status' in err
+            ? (err as { status: number }).status
+            : undefined;
+        if (status === 404) return null;
+        throw err;
+      }
+    });
+  }
+
+  /** Changed file paths for a PR (capped) — used by failure analysis agent tools. */
+  async listPullRequestFiles(
+    number: number,
+    limit = 40,
+  ): Promise<Array<{ filename: string; status: string; additions: number; deletions: number }>> {
+    return this.cached(this.cacheKey('pr-files', number, String(limit)), async () => {
+      const files: Array<{
+        filename: string;
+        status: string;
+        additions: number;
+        deletions: number;
+      }> = [];
+      for await (const page of this.octokit.paginate.iterator(this.octokit.pulls.listFiles, {
+        owner: this.ref.owner,
+        repo: this.ref.repo,
+        pull_number: number,
+        per_page: 100,
+      })) {
+        for (const f of page.data) {
+          files.push({
+            filename: f.filename,
+            status: f.status,
+            additions: f.additions,
+            deletions: f.deletions,
+          });
+          if (files.length >= limit) return files;
+        }
+      }
+      return files;
+    });
+  }
+
   async getPullRequest(number: number): Promise<PrDetail> {
     return this.cached(this.cacheKey('pr', number), async () => {
       const { data: pr } = await this.octokit.pulls.get({
