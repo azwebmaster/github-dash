@@ -271,6 +271,7 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
   const [analysis, setAnalysis] = useState<WorkflowFailureAnalysis | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingCache, setLoadingCache] = useState(true);
   const [status, setStatus] = useState<string | null>(null);
   const [logEntries, setLogEntries] = useState<AnalysisLogEntry[]>([]);
   const logIdRef = useRef(0);
@@ -281,6 +282,39 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
       abortRef.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingCache(true);
+    setAnalysis(null);
+    setError(null);
+    setStatus(null);
+    setLogEntries([]);
+    logIdRef.current = 0;
+
+    void (async () => {
+      try {
+        const cached = await api.getWorkflowAnalysis(runId);
+        if (cancelled) return;
+        if (cached) {
+          setAnalysis(cached);
+          setStatus(
+            cached.analyzedAt
+              ? `Loaded cached analysis from ${formatDate(cached.analyzedAt)}`
+              : 'Loaded cached analysis',
+          );
+        }
+      } catch {
+        // No cache / transient error — user can still run Analyze.
+      } finally {
+        if (!cancelled) setLoadingCache(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
 
   const appendLog = (role: AnalysisLogEntry['role'], text: string) => {
     const trimmed = text.trim();
@@ -315,20 +349,21 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
     }
   };
 
-  const runAnalysis = async () => {
+  const runAnalysis = async (refresh: boolean) => {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
     setLoading(true);
     setError(null);
-    setStatus('Starting…');
+    setStatus(refresh ? 'Re-analyzing…' : 'Starting…');
     setLogEntries([]);
     logIdRef.current = 0;
 
     try {
       const result = await api.analyzeWorkflowStream(runId, handleEvent, {
         signal: controller.signal,
+        refresh,
       });
       setAnalysis(result);
     } catch (err) {
@@ -367,15 +402,15 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
             </Stack>
             <Typography variant="body2" color="text.secondary">
               Uses release notes and orchestration stage test reports to identify the likely PR and
-              author.
+              author. Results are cached so revisiting a run does not re-run Claude.
             </Typography>
           </Stack>
           <Button
             variant="contained"
             color="secondary"
             startIcon={loading ? <CircularProgress size={16} color="inherit" /> : <AutoAwesomeIcon />}
-            onClick={() => void runAnalysis()}
-            disabled={loading}
+            onClick={() => void runAnalysis(Boolean(analysis))}
+            disabled={loading || loadingCache}
           >
             {loading ? 'Analyzing…' : analysis ? 'Re-analyze' : 'Analyze failure'}
           </Button>
@@ -397,6 +432,14 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
             <Typography>{analysis.summary}</Typography>
 
             <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+              {analysis.analyzedAt ? (
+                <Chip
+                  size="small"
+                  label={`cached ${formatDate(analysis.analyzedAt)}`}
+                  variant="outlined"
+                  color="secondary"
+                />
+              ) : null}
               {analysis.tagName ? (
                 <Chip size="small" label={`tag ${analysis.tagName}`} variant="outlined" />
               ) : null}

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -21,6 +22,16 @@ import {
 import type { GitHubService } from './service.js';
 
 export type AnalysisProgressHandler = (event: WorkflowFailureAnalysisEvent) => void;
+
+export interface AnalyzeWorkflowFailureOptions {
+  /** When true, ignore any cached analysis and re-run Claude. */
+  refresh?: boolean;
+  onProgress?: AnalysisProgressHandler;
+}
+
+function analysisModel(): string {
+  return process.env.CLAUDE_MODEL?.trim() || 'sonnet';
+}
 
 /** Claude Code / Agent SDK user config directory (`CLAUDE_CONFIG_DIR` or `~/.claude`). */
 export function claudeConfigDir(): string {
@@ -111,6 +122,36 @@ export interface FailureAnalysisContext {
     failedSteps: string[];
   }>;
   failedStages: WorkflowFailureStage[];
+}
+
+/**
+ * Fingerprint of inputs that affect Claude's answer.
+ * Cache hits require an exact match so orchestration/test updates invalidate stale results.
+ */
+export function failureAnalysisFingerprint(ctx: FailureAnalysisContext): string {
+  const payload = {
+    model: analysisModel(),
+    run: {
+      id: ctx.run.id,
+      conclusion: ctx.run.conclusion,
+      status: ctx.run.status,
+      headSha: ctx.run.headSha,
+      branch: ctx.run.branch,
+    },
+    tagName: ctx.tagName,
+    releaseNotesSource: ctx.releaseNotesSource,
+    releaseNotes: ctx.releaseNotes,
+    authorMentions: ctx.authorMentions,
+    associatedPrs: ctx.associatedPrs.map((pr) => ({
+      number: pr.number,
+      title: pr.title,
+      author: pr.author,
+      mergedAt: pr.mergedAt,
+    })),
+    failedJobs: ctx.failedJobs,
+    failedStages: ctx.failedStages,
+  };
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex').slice(0, 24);
 }
 
 function isFailureConclusion(conclusion: string | null | undefined): boolean {
@@ -629,7 +670,7 @@ export async function runClaudeFailureAnalysis(
     for await (const message of query({
       prompt: buildPrompt(ctx),
       options: {
-        model: process.env.CLAUDE_MODEL?.trim() || 'sonnet',
+        model: analysisModel(),
         permissionMode: 'bypassPermissions',
         // Load ~/.claude/settings.json so apiKeyHelper / user env apply.
         settingSources: ['user'],
@@ -706,8 +747,9 @@ export async function runClaudeFailureAnalysis(
 export async function analyzeWorkflowFailure(
   github: GitHubService,
   runId: number,
-  onProgress?: AnalysisProgressHandler,
+  options: AnalyzeWorkflowFailureOptions = {},
 ): Promise<WorkflowFailureAnalysis> {
+  const { refresh = false, onProgress } = options;
   const emit = (event: WorkflowFailureAnalysisEvent) => {
     try {
       onProgress?.(event);
@@ -721,6 +763,27 @@ export async function analyzeWorkflowFailure(
 
   emit({ type: 'status', message: 'Building failure context (jobs, stages, test reports, release notes)…' });
   const ctx = await buildFailureAnalysisContext(github, run);
+  const fingerprint = failureAnalysisFingerprint(ctx);
+
+  if (!refresh) {
+    const stored = await github.getCachedFailureAnalysis(runId);
+    if (stored && stored.fingerprint === fingerprint) {
+      emit({ type: 'status', message: 'Loaded cached analysis' });
+      emit({
+        type: 'log',
+        role: 'system',
+        text: `Using cached analysis from ${stored.analyzedAt} (skipped Claude).`,
+      });
+      const analysis: WorkflowFailureAnalysis = {
+        ...stored.analysis,
+        analyzedAt: stored.analyzedAt,
+      };
+      emit({ type: 'result', analysis });
+      return analysis;
+    }
+  } else {
+    await github.clearCachedFailureAnalysis(runId);
+  }
 
   const testStageCount = ctx.failedStages.filter((s) => s.testReport).length;
   emit({
@@ -733,6 +796,7 @@ export async function analyzeWorkflowFailure(
   });
 
   const agent = await runClaudeFailureAnalysis(github, ctx, onProgress);
+  const analyzedAt = new Date().toISOString();
 
   const analysis: WorkflowFailureAnalysis = {
     runId: run.id,
@@ -752,7 +816,14 @@ export async function analyzeWorkflowFailure(
     summary: agent.summary,
     likelyCause: agent.likelyCause,
     model: agent.model,
+    analyzedAt,
   };
+
+  await github.setCachedFailureAnalysis(runId, {
+    fingerprint,
+    analyzedAt,
+    analysis,
+  });
 
   emit({ type: 'result', analysis });
   return analysis;

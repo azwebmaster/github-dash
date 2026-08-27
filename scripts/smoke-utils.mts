@@ -230,6 +230,7 @@ on:
     extractFailedStages,
     compactTestReport,
     describeSdkMessage,
+    failureAnalysisFingerprint,
   } = await import('../src/server/github/failure-analysis.ts');
   const runBase = {
     id: 1,
@@ -416,6 +417,212 @@ on:
     }),
     [{ type: 'log', role: 'assistant', text: 'Checking failed tests…' }],
   );
+
+  const fingerprintCtx = {
+    run: {
+      id: 99,
+      name: 'Release',
+      workflowName: 'Release',
+      conclusion: 'failure',
+      status: 'completed',
+      event: 'push',
+      branch: 'v1.0.0',
+      headSha: 'deadbeef',
+      htmlUrl: 'https://example.com',
+    },
+    tagName: 'v1.0.0',
+    releaseNotesSource: 'orchestration' as const,
+    release: null,
+    releaseNotes: 'Fixes #12',
+    authorMentions: { '12': '@alice' },
+    associatedPrs: [
+      {
+        number: 12,
+        title: 'Fix checkout',
+        author: 'alice',
+        htmlUrl: 'https://example.com/pull/12',
+        mergedAt: '2026-08-01T00:00:00.000Z',
+      },
+    ],
+    failedJobs: [{ name: 'Test', conclusion: 'failure', failedSteps: ['Run suite'] }],
+    failedStages: withTests,
+  };
+  const fp1 = failureAnalysisFingerprint(fingerprintCtx);
+  const fp2 = failureAnalysisFingerprint(fingerprintCtx);
+  assert.equal(fp1, fp2);
+  assert.equal(fp1.length, 24);
+  const fpChanged = failureAnalysisFingerprint({
+    ...fingerprintCtx,
+    releaseNotes: 'Fixes #12 and #13',
+  });
+  assert.notEqual(fp1, fpChanged);
+}
+
+{
+  const { MemoryCache } = await import('../src/server/cache/memory.ts');
+  const { GitHubService } = await import('../src/server/github/service.ts');
+  const {
+    analyzeWorkflowFailure,
+    failureAnalysisFingerprint,
+    buildFailureAnalysisContext,
+  } = await import('../src/server/github/failure-analysis.ts');
+
+  const cache = new MemoryCache({ defaultTtlMs: 50 });
+  const github = new GitHubService({
+    owner: 'acme',
+    repo: 'app',
+    token: 'test-token',
+    cache,
+  });
+
+  assert.equal(await github.getCachedFailureAnalysis(42), undefined);
+
+  const analysis = {
+    runId: 42,
+    tagName: 'v1.0.0',
+    release: null,
+    releaseNotesSource: 'none' as const,
+    associatedPrs: [],
+    failedJobs: [{ name: 'Test', conclusion: 'failure', failedSteps: ['Run suite'] }],
+    failedStages: [],
+    summary: 'Tests failed in QA',
+    likelyCause: {
+      prNumber: 7,
+      prTitle: 'Break tests',
+      author: 'bob',
+      confidence: 'high' as const,
+      reasoning: 'Matched failing suite names',
+    },
+    model: 'claude-sonnet',
+    analyzedAt: '2026-08-27T12:00:00.000Z',
+  };
+
+  await github.setCachedFailureAnalysis(42, {
+    fingerprint: 'abc123',
+    analyzedAt: analysis.analyzedAt!,
+    analysis,
+  });
+
+  const stored = await github.getCachedFailureAnalysis(42);
+  assert.equal(stored?.fingerprint, 'abc123');
+  assert.equal(stored?.analysis.summary, 'Tests failed in QA');
+  assert.equal(stored?.analysis.likelyCause.prNumber, 7);
+
+  // No-expiry analysis entries survive short default TTLs.
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal((await github.getCachedFailureAnalysis(42))?.fingerprint, 'abc123');
+
+  await github.clearCachedFailureAnalysis(42);
+  assert.equal(await github.getCachedFailureAnalysis(42), undefined);
+
+  // Cache-hit path must not require Claude credentials.
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  const prevOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  process.env.CLAUDE_CONFIG_DIR = '/tmp/github-dash-no-claude-settings';
+
+  const mockRun = {
+    id: 77,
+    name: 'Release',
+    workflowId: 2,
+    workflowName: 'Release',
+    status: 'completed' as const,
+    conclusion: 'failure' as const,
+    event: 'push',
+    branch: 'main',
+    headSha: 'abc1234',
+    createdAt: '2026-08-01T00:00:00.000Z',
+    updatedAt: '2026-08-01T01:00:00.000Z',
+    runStartedAt: '2026-08-01T00:00:00.000Z',
+    durationSeconds: 100,
+    htmlUrl: 'https://example.com/actions/runs/77',
+    attempt: 1,
+    jobs: [
+      {
+        id: 1,
+        name: 'Test',
+        status: 'completed',
+        conclusion: 'failure',
+        createdAt: null,
+        startedAt: null,
+        completedAt: null,
+        durationSeconds: null,
+        queueSeconds: null,
+        htmlUrl: '',
+        steps: [
+          {
+            name: 'Run suite',
+            status: 'completed',
+            conclusion: 'failure',
+            number: 1,
+            durationSeconds: 10,
+            htmlUrl: '',
+          },
+        ],
+      },
+    ],
+    orchestration: null,
+    orchestrationArtifact: null,
+  };
+
+  github.getWorkflowRun = (async () => mockRun) as typeof github.getWorkflowRun;
+  github.findReleaseByTag = (async () => null) as typeof github.findReleaseByTag;
+  github.getPullRequestSummaries = (async () => []) as typeof github.getPullRequestSummaries;
+
+  try {
+    const ctx = await buildFailureAnalysisContext(github, mockRun);
+    const fingerprint = failureAnalysisFingerprint(ctx);
+    const cachedAnalysis = {
+      runId: 77,
+      tagName: null,
+      release: null,
+      releaseNotesSource: 'none' as const,
+      associatedPrs: [],
+      failedJobs: ctx.failedJobs,
+      failedStages: ctx.failedStages,
+      summary: 'Cached summary — Claude was not called',
+      likelyCause: {
+        prNumber: null,
+        prTitle: null,
+        author: null,
+        confidence: 'low' as const,
+        reasoning: 'From cache',
+      },
+      model: 'cached-model',
+      analyzedAt: '2026-08-27T15:00:00.000Z',
+    };
+    await github.setCachedFailureAnalysis(77, {
+      fingerprint,
+      analyzedAt: cachedAnalysis.analyzedAt!,
+      analysis: cachedAnalysis,
+    });
+
+    const events: Array<{ type: string; message?: string; text?: string }> = [];
+    const result = await analyzeWorkflowFailure(github, 77, {
+      onProgress: (event) => {
+        if (event.type === 'status') events.push({ type: 'status', message: event.message });
+        if (event.type === 'log') events.push({ type: 'log', text: event.text });
+      },
+    });
+    assert.equal(result.summary, 'Cached summary — Claude was not called');
+    assert.equal(result.analyzedAt, '2026-08-27T15:00:00.000Z');
+    assert.ok(events.some((e) => e.message === 'Loaded cached analysis'));
+    assert.ok(events.some((e) => e.text?.includes('skipped Claude')));
+
+    await assert.rejects(
+      () => analyzeWorkflowFailure(github, 77, { refresh: true }),
+      /Claude Agent is not configured/,
+    );
+  } finally {
+    if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevKey;
+    if (prevOauth === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    else process.env.CLAUDE_CODE_OAUTH_TOKEN = prevOauth;
+    if (prevConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prevConfigDir;
+  }
 }
 
 {

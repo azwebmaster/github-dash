@@ -66,9 +66,9 @@ Vite serves the UI on `:5173` and proxies `/api` to the Express server on `:3847
 - **Commits** — recent history, verification, author stats, file-level drill-down
 - **Releases** — publish cadence timing; release notes parsed for `#123` / PR URLs; associated PRs listed on the detail page; creating-run stats from the configured release workflow (default `release.yml`), matched by release tag; cached release-train / orchestration stage health
 - **Workflows** — Actions success rate and duration stats with per-workflow flake streaks, conclusion strips, and duration sparklines; pin summary cards; click a workflow to see its past 100 runs, then open a run for job/step timings with longest job and step highlighted
-- **Failure analysis** — on failed runs, **Analyze failure** uses the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) with release notes and orchestration stage **TestReport** data (failed suites/tests) to suggest the likely PR and author; the UI streams progress/chat logs while the agent runs (auth via `ANTHROPIC_API_KEY` or `apiKeyHelper` / env in `~/.claude/settings.json`)
+- **Failure analysis** — on failed runs, **Analyze failure** uses the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) with release notes and orchestration stage **TestReport** data (failed suites/tests) to suggest the likely PR and author; the UI streams progress/chat logs while the agent runs (auth via `ANTHROPIC_API_KEY` or `apiKeyHelper` / env in `~/.claude/settings.json`). Results are cached in-memory per run so revisiting a workflow run restores the prior analysis without re-calling Claude; **Re-analyze** forces a fresh run (`?refresh=1`)
 
-GitHub responses are cached in-memory (`CACHE_TTL_MS`, default 5 minutes). Overview and orchestration health are warmed on server start.
+GitHub responses are cached in-memory (`CACHE_TTL_MS`, default 5 minutes). Overview and orchestration health are warmed on server start. Claude failure analyses use a separate no-expiry in-memory entry per run (cleared on process restart or **Re-analyze**).
 
 ## API
 
@@ -86,5 +86,6 @@ GitHub responses are cached in-memory (`CACHE_TTL_MS`, default 5 minutes). Overv
 | `GET /api/workflows` | Workflow runs + metrics (includes per-workflow ids for drill-down) |
 | `GET /api/workflows/by/:workflowId` | Past 100 runs for a selected workflow |
 | `GET /api/workflows/:id` | Run detail with jobs/steps and durations |
-| `POST /api/workflows/:id/analyze` | Claude Agent SDK failure analysis (tag → release notes + stage TestReports → likely PR/author). Add `?stream=1` (or `Accept: application/x-ndjson`) for NDJSON progress/chat events |
+| `GET /api/workflows/:id/analyze` | Cached Claude failure analysis for a run (404 when none stored) |
+| `POST /api/workflows/:id/analyze` | Claude Agent SDK failure analysis (tag → release notes + stage TestReports → likely PR/author). Add `?stream=1` (or `Accept: application/x-ndjson`) for NDJSON progress/chat events. Add `?refresh=1` to bypass the cache and re-run Claude |
 | `GET /api/orchestration/health` | Cached release-workflow orchestration stage rollups |

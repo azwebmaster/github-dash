@@ -459,6 +459,15 @@ export interface WorkflowFailureAnalysis {
     reasoning: string;
   };
   model: string | null;
+  /** ISO timestamp when this analysis was produced (set when cached). */
+  analyzedAt?: string | null;
+}
+
+/** Server-side stored Claude analysis (keyed by workflow run id). */
+export interface StoredWorkflowFailureAnalysis {
+  fingerprint: string;
+  analyzedAt: string;
+  analysis: WorkflowFailureAnalysis;
 }
 
 export interface WorkflowStats {

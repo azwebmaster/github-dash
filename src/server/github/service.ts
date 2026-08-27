@@ -16,6 +16,7 @@ import type {
   ReleaseStats,
   ReleaseSummary,
   RepoRef,
+  StoredWorkflowFailureAnalysis,
   WorkflowConclusionKind,
   WorkflowLifecycleMap,
   WorkflowMapEntry,
@@ -194,6 +195,38 @@ export class GitHubService {
         const message = err instanceof Error ? err.message : String(err);
         console.warn(`[cache] warmDefaults failed: ${message}`);
       });
+  }
+
+  private failureAnalysisCacheKey(runId: number): string {
+    return this.cacheKey('workflow-failure-analysis', runId);
+  }
+
+  /** Read a previously cached Claude failure analysis for this run (if any). */
+  async getCachedFailureAnalysis(
+    runId: number,
+  ): Promise<StoredWorkflowFailureAnalysis | undefined> {
+    return this.cache.get<StoredWorkflowFailureAnalysis>(this.failureAnalysisCacheKey(runId));
+  }
+
+  /**
+   * Persist Claude failure analysis for a run.
+   * Uses TTL 0 (no expiry) — completed-run analysis is stable within the process lifetime.
+   */
+  async setCachedFailureAnalysis(
+    runId: number,
+    stored: StoredWorkflowFailureAnalysis,
+  ): Promise<void> {
+    await this.cache.set(this.failureAnalysisCacheKey(runId), stored, 0);
+    if (this.cacheDebugEnabled()) {
+      console.log(`[cache] SET  ${this.failureAnalysisCacheKey(runId)}`);
+    }
+  }
+
+  async clearCachedFailureAnalysis(runId: number): Promise<void> {
+    await this.cache.delete(this.failureAnalysisCacheKey(runId));
+    if (this.cacheDebugEnabled()) {
+      console.log(`[cache] DEL  ${this.failureAnalysisCacheKey(runId)}`);
+    }
   }
 
   async getOverview(days: AgeLookbackDays = DEFAULT_AGE_LOOKBACK_DAYS): Promise<OverviewStats> {

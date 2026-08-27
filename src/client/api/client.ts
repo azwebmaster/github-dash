@@ -122,18 +122,45 @@ export const api = {
     const qs = params.toString();
     return request<WorkflowRunDetail>(`/api/workflows/${id}${qs ? `?${qs}` : ''}`);
   },
-  analyzeWorkflow: (id: number) =>
-    request<WorkflowFailureAnalysis>(`/api/workflows/${id}/analyze`, { method: 'POST' }),
+  analyzeWorkflow: (id: number, opts?: { refresh?: boolean }) => {
+    const params = new URLSearchParams();
+    if (opts?.refresh) params.set('refresh', '1');
+    const qs = params.toString();
+    return request<WorkflowFailureAnalysis>(
+      `/api/workflows/${id}/analyze${qs ? `?${qs}` : ''}`,
+      { method: 'POST' },
+    );
+  },
+  /** Return cached Claude analysis for a run, or null when none is stored. */
+  getWorkflowAnalysis: async (id: number): Promise<WorkflowFailureAnalysis | null> => {
+    const res = await fetch(`/api/workflows/${id}/analyze`);
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      let message = res.statusText;
+      try {
+        const body = (await res.json()) as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        // ignore
+      }
+      throw new Error(message || `Request failed (${res.status})`);
+    }
+    return (await res.json()) as WorkflowFailureAnalysis;
+  },
   /**
    * Stream failure analysis progress as NDJSON events.
    * Invokes `onEvent` for status/log/result/error frames; resolves with the final analysis.
+   * Cached results are returned immediately unless `refresh` is set.
    */
   analyzeWorkflowStream: async (
     id: number,
     onEvent: (event: WorkflowFailureAnalysisEvent) => void,
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; refresh?: boolean },
   ): Promise<WorkflowFailureAnalysis> => {
-    const res = await fetch(`/api/workflows/${id}/analyze?stream=1`, {
+    const params = new URLSearchParams();
+    params.set('stream', '1');
+    if (opts?.refresh) params.set('refresh', '1');
+    const res = await fetch(`/api/workflows/${id}/analyze?${params}`, {
       method: 'POST',
       headers: { Accept: 'application/x-ndjson' },
       signal: opts?.signal,
