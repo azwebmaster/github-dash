@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type {
@@ -11,6 +14,39 @@ import {
   resolveWorkflowRunTag,
 } from '../../shared/utils.js';
 import type { GitHubService } from './service.js';
+
+/** Claude Code / Agent SDK user config directory (`CLAUDE_CONFIG_DIR` or `~/.claude`). */
+export function claudeConfigDir(): string {
+  const override = process.env.CLAUDE_CONFIG_DIR?.trim();
+  return override || join(homedir(), '.claude');
+}
+
+export interface ClaudeUserSettings {
+  apiKeyHelper?: unknown;
+  env?: unknown;
+}
+
+/** Read `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) when present. */
+export function readClaudeUserSettings(): ClaudeUserSettings | null {
+  const settingsPath = join(claudeConfigDir(), 'settings.json');
+  if (!existsSync(settingsPath)) return null;
+  try {
+    const raw = readFileSync(settingsPath, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    return parsed as ClaudeUserSettings;
+  } catch {
+    return null;
+  }
+}
+
+function settingsEnvString(settings: ClaudeUserSettings | null, key: string): string | undefined {
+  if (!settings?.env || typeof settings.env !== 'object' || Array.isArray(settings.env)) {
+    return undefined;
+  }
+  const value = (settings.env as Record<string, unknown>)[key];
+  return typeof value === 'string' ? value : undefined;
+}
 
 const ORCH_STAGE_FAILURE = 4;
 
@@ -311,8 +347,23 @@ function createAnalysisMcpServer(ctx: FailureAnalysisContext, github: GitHubServ
   });
 }
 
+/**
+ * True when the Claude Agent SDK can authenticate via env vars or user settings
+ * (`apiKeyHelper` / `env` in `~/.claude/settings.json`).
+ */
 export function isClaudeAgentConfigured(): boolean {
-  return Boolean(process.env.ANTHROPIC_API_KEY?.trim() || process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim());
+  if (process.env.ANTHROPIC_API_KEY?.trim() || process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim()) {
+    return true;
+  }
+  const settings = readClaudeUserSettings();
+  if (!settings) return false;
+  if (typeof settings.apiKeyHelper === 'string' && settings.apiKeyHelper.trim()) {
+    return true;
+  }
+  return Boolean(
+    settingsEnvString(settings, 'ANTHROPIC_API_KEY')?.trim() ||
+      settingsEnvString(settings, 'CLAUDE_CODE_OAUTH_TOKEN')?.trim(),
+  );
 }
 
 export async function runClaudeFailureAnalysis(
@@ -321,7 +372,7 @@ export async function runClaudeFailureAnalysis(
 ): Promise<Pick<WorkflowFailureAnalysis, 'summary' | 'likelyCause' | 'model'>> {
   if (!isClaudeAgentConfigured()) {
     const err = new Error(
-      'ANTHROPIC_API_KEY is not set. Export an Anthropic API key to enable Claude Agent failure analysis.',
+      'Claude Agent is not configured. Set ANTHROPIC_API_KEY, or configure apiKeyHelper (and related env) in ~/.claude/settings.json.',
     );
     (err as Error & { status: number }).status = 503;
     throw err;
@@ -342,8 +393,10 @@ export async function runClaudeFailureAnalysis(
       options: {
         model: process.env.CLAUDE_MODEL?.trim() || 'sonnet',
         permissionMode: 'bypassPermissions',
-        settingSources: [],
-        // Only custom MCP tools — no local filesystem / shell for this analysis.
+        // Load ~/.claude/settings.json so apiKeyHelper / user env apply.
+        settingSources: ['user'],
+        // Keep analysis isolated: no filesystem skills; only our MCP tools.
+        skills: [],
         tools: [],
         mcpServers: { 'github-dash': mcpServer },
         allowedTools: ['mcp__github-dash__get_failure_context', 'mcp__github-dash__get_pr_detail'],

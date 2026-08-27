@@ -10,6 +10,7 @@ import {
   parseAgeLookbackParam,
   parseRunLimitParam,
 } from '../shared/utils.js';
+import { isClaudeAgentConfigured } from './github/failure-analysis.js';
 import { GitHubService } from './github/service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -52,9 +53,7 @@ export function createApp(options: CreateAppOptions): Express {
       owner: options.owner,
       repo: options.repo,
       releaseWorkflowFile: github.releaseWorkflowFile,
-      claudeAnalysisAvailable: Boolean(
-        process.env.ANTHROPIC_API_KEY?.trim() || process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim(),
-      ),
+      claudeAnalysisAvailable: isClaudeAgentConfigured(),
     });
   });
 

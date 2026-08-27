@@ -194,7 +194,8 @@ function FailureAnalysisPanel({ runId }: { runId: number }) {
 
         {meta?.claudeAnalysisAvailable === false ? (
           <Alert severity="warning">
-            Set <code>ANTHROPIC_API_KEY</code> on the server to enable Claude Agent analysis.
+            Configure Claude Agent auth: set <code>ANTHROPIC_API_KEY</code>, or{' '}
+            <code>apiKeyHelper</code> (and related settings) in <code>~/.claude/settings.json</code>.
           </Alert>
         ) : null}
 

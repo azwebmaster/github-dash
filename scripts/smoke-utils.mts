@@ -347,4 +347,48 @@ on:
   );
 }
 
+{
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const {
+    isClaudeAgentConfigured,
+    readClaudeUserSettings,
+  } = await import('../src/server/github/failure-analysis.ts');
+
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  const prevOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+
+  const dir = mkdtempSync(join(tmpdir(), 'claude-settings-'));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  try {
+    assert.equal(readClaudeUserSettings(), null);
+    assert.equal(isClaudeAgentConfigured(), false);
+
+    writeFileSync(
+      join(dir, 'settings.json'),
+      JSON.stringify({ apiKeyHelper: 'cat ~/.anthropic/api-key' }),
+    );
+    assert.equal(readClaudeUserSettings()?.apiKeyHelper, 'cat ~/.anthropic/api-key');
+    assert.equal(isClaudeAgentConfigured(), true);
+
+    writeFileSync(join(dir, 'settings.json'), JSON.stringify({ env: { ANTHROPIC_API_KEY: 'sk-test' } }));
+    assert.equal(isClaudeAgentConfigured(), true);
+
+    writeFileSync(join(dir, 'settings.json'), JSON.stringify({}));
+    assert.equal(isClaudeAgentConfigured(), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevKey;
+    if (prevOauth === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    else process.env.CLAUDE_CODE_OAUTH_TOKEN = prevOauth;
+    if (prevConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prevConfigDir;
+  }
+}
+
 console.log('ok');
